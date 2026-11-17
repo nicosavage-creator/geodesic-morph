@@ -1,0 +1,1417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#9fb1a4">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Geodesic Morph</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#9fb1a4;
+  overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+body{position:fixed;left:0;top:0;right:0;bottom:0}
+canvas{position:fixed;left:0;top:0;width:100vw;height:100vh;height:100dvh;display:block;
+  touch-action:none;outline:none;background:#9fb1a4}
+#dbg{position:fixed;left:6px;top:6px;font:11px/1.35 monospace;color:#2b2338;background:rgba(242,238,245,.78);
+  padding:4px 7px;border-radius:4px;pointer-events:none;white-space:pre;display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas><div id="dbg"></div>
+<script>
+/* Geodesic Morph - one self-contained file: raw WebGL 1 + GLSL, no libraries, no external assets.
+   URL options: ?fps=30|60  ?t=<seconds>  ?debug  ?q=low|med|high
+   Test-only:   &pause (freeze the scene clock at ?t)   &lat=42 (coarser lattice)   &view=a|blur|bloom|grain|aux
+   Loop rule:   every time-based motion is sin/cos(k * 2*PI/600 * t) with integer k -> exact 600 s loop. */
+(function(){
+'use strict';
+var TAU=6.283185307179586,LOOP=600,W0=TAU/LOOP;
+
+/* ------------------------------------------------------------------ options */
+var QS=new URLSearchParams(location.search);
+function qn(k,d){var v=parseFloat(QS.get(k));return isFinite(v)?v:d;}
+var OPT={
+  fps:qn('fps',60)<=30?30:60,
+  t:qn('t',0),
+  debug:QS.has('debug'),
+  q:(QS.get('q')||'').toLowerCase(),
+  pause:QS.has('pause')||QS.has('freeze'),
+  nowrap:QS.has('nowrap'),
+  lat:qn('lat',42)>100?162:42,
+  shade:QS.get('shade')==='0'?0:1,
+  view:(QS.get('view')||'').toLowerCase()
+};
+
+/* ------------------------------------------------------------------ scene constants (world unit = mean body radius) */
+var CAM_D=2.6;        // camera distance  -> ~35 deg FOV across the short screen side
+var BOUND=1.17;       // nothing (cage, pearls, blur, touch pull) may leave this radius
+var FIT=0.47;         // BOUND maps to 42% of the short side -> 8% margin each side
+var CENTER_UP=0.0;  // object centre sits 4.5% of the height above the middle
+var TILT0=0.0;      // low camera: top of the object tilted away
+var CX=0,CY=0,CZ=-CAM_D;
+var SHOW_CAGE=QS.has('cage');
+var BGI=qn('bg',1.4);   // background intensity dial: ?bg=1.4 etc.
+var DOF_GAIN=qn('dof',12);
+var CAGE_R=1.10,CG_PEARL=0.042,CG_ROD=0.017,CG_STRUT=0.011;
+
+/* ------------------------------------------------------------------ helpers */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+var rnd=mulberry32(20261114);
+function rr(a,b){return a+(b-a)*rnd();}
+function ri(a,b){return a+Math.floor(rnd()*(b-a+1));}
+function sstep(a,b,x){x=(x-a)/(b-a);x=x<0?0:x>1?1:x;return x*x*(3-2*x);}
+function clamp(x,a,b){return x<a?a:x>b?b:x;}
+function m3mul(a,b,o){
+  var a0=a[0],a1=a[1],a2=a[2],a3=a[3],a4=a[4],a5=a[5],a6=a[6],a7=a[7],a8=a[8];
+  var b0=b[0],b1=b[1],b2=b[2],b3=b[3],b4=b[4],b5=b[5],b6=b[6],b7=b[7],b8=b[8];
+  o[0]=a0*b0+a1*b3+a2*b6;o[1]=a0*b1+a1*b4+a2*b7;o[2]=a0*b2+a1*b5+a2*b8;
+  o[3]=a3*b0+a4*b3+a5*b6;o[4]=a3*b1+a4*b4+a5*b7;o[5]=a3*b2+a4*b5+a5*b8;
+  o[6]=a6*b0+a7*b3+a8*b6;o[7]=a6*b1+a7*b4+a8*b7;o[8]=a6*b2+a7*b5+a8*b8;
+}
+function m3rx(t,o){var c=Math.cos(t),s=Math.sin(t);o[0]=1;o[1]=0;o[2]=0;o[3]=0;o[4]=c;o[5]=-s;o[6]=0;o[7]=s;o[8]=c;}
+function m3ry(t,o){var c=Math.cos(t),s=Math.sin(t);o[0]=c;o[1]=0;o[2]=s;o[3]=0;o[4]=1;o[5]=0;o[6]=-s;o[7]=0;o[8]=c;}
+function m3rz(t,o){var c=Math.cos(t),s=Math.sin(t);o[0]=c;o[1]=-s;o[2]=0;o[3]=s;o[4]=c;o[5]=0;o[6]=0;o[7]=0;o[8]=1;}
+/* periodic "noise": a few travelling plane waves, every temporal frequency an integer multiple of 2PI/600 */
+function makeWaves(ks,amps,smin,smax){
+  var n=ks.length,w={n:n,k:new Float64Array(n),a:new Float64Array(n),qx:new Float64Array(n),qy:new Float64Array(n),qz:new Float64Array(n),c:new Float64Array(n),norm:0};
+  for(var j=0;j<n;j++){
+    var z=rr(-1,1),ph=rr(0,TAU),s=Math.sqrt(1-z*z),f=rr(smin,smax);
+    w.k[j]=ks[j]*(rnd()<0.5?-1:1);w.a[j]=amps[j];
+    w.qx[j]=s*Math.cos(ph)*f;w.qy[j]=z*f;w.qz[j]=s*Math.sin(ph)*f;w.c[j]=rr(0,TAU);w.norm+=Math.abs(amps[j]);
+  }
+  return w;
+}
+function wav(w,x,y,z,t){var s=0;for(var j=0;j<w.n;j++)s+=w.a[j]*Math.sin(w.k[j]*W0*t+w.qx[j]*x+w.qy[j]*y+w.qz[j]*z+w.c[j]);return s;}
+
+/* ------------------------------------------------------------------ palette (sampled from the reference video; hue 262..322 deg) */
+/* COLOUR: the source video turns the body through the whole hue wheel in one direction (violet -> orchid ->
+   rose -> peach -> olive -> green -> teal -> blue -> violet). The violet-phase ramp sampled from the clip is the
+   base; every other phase is that ramp with its hue rotated in OKLCH (lightness and chroma kept, chroma eased
+   only where sRGB cannot hold it), so it stays a soft frosted pastel all the way round.
+   The background is the sage of the violet phase rotated by the same angle = roughly the body's complement. */
+var BASE_RAMP=[[0,'#603f86'],[0.15,'#7e66af'],[0.30,'#916bb1'],[0.45,'#a582ce'],[0.60,'#b79fe1'],[0.78,'#ceb9ef'],[0.92,'#e0d8f7'],[1,'#e8dcf8']];
+var BG_BASE='#a3b2a3';
+function hex3(h){return [parseInt(h.substr(1,2),16)/255,parseInt(h.substr(3,2),16)/255,parseInt(h.substr(5,2),16)/255];}
+function s2l(c){return c<=0.04045?c/12.92:Math.pow((c+0.055)/1.055,2.4);}
+function l2s(c){return c<=0.0031308?12.92*c:1.055*Math.pow(c,1/2.4)-0.055;}
+function toLab(c,o){var r=s2l(c[0]),g=s2l(c[1]),b=s2l(c[2]);
+  var l=Math.cbrt(0.4122214708*r+0.5363325363*g+0.0514459929*b),m=Math.cbrt(0.2119034982*r+0.6806995451*g+0.1073969566*b),q=Math.cbrt(0.0883024619*r+0.2817188376*g+0.6299787005*b);
+  o[0]=0.2104542553*l+0.7936177850*m-0.0040720468*q;o[1]=1.9779984951*l-2.4285922050*m+0.4505937099*q;o[2]=0.0259040371*l+0.7827717662*m-0.8086757660*q;}
+function fromLab(L,a,b,o){var l=L+0.3963377774*a+0.2158037573*b,m=L-0.1055613458*a-0.0638541728*b,q=L-0.0894841775*a-1.2914855480*b;l=l*l*l;m=m*m*m;q=q*q*q;
+  var r=4.0767416621*l-3.3077115913*m+0.2309699292*q,g=-1.2684380046*l+2.6097574011*m-0.3413193965*q,bb=-0.0041960863*l-0.7034186147*m+1.7076147010*q;
+  o[0]=l2s(clamp(r,0,1));o[1]=l2s(clamp(g,0,1));o[2]=l2s(clamp(bb,0,1));
+  return r>=-0.0005&&r<=1.0005&&g>=-0.0005&&g<=1.0005&&bb>=-0.0005&&bb<=1.0005;}
+var _lab=[0,0,0],_pa=[0,0,0];
+function rotHue(c,ang,o){toLab(c,_lab);var ca=Math.cos(ang),sa=Math.sin(ang),pk=0.80+0.20*ca,a=(_lab[1]*ca-_lab[2]*sa)*pk,b=(_lab[1]*sa+_lab[2]*ca)*pk;   // pk: a little less chroma away from violet keeps yellow / cyan frosted, never neon
+  for(var k=1;k>0.3;k-=0.04)if(fromLab(_lab[0],a*k,b*k,o))return;}
+(function(){for(var j=0;j<BASE_RAMP.length;j++)BASE_RAMP[j][1]=hex3(BASE_RAMP[j][1]);BG_BASE=hex3(BG_BASE);})();
+function rampAt(tone,o){
+  var st=BASE_RAMP,n=st.length;tone=clamp(tone,0,1);
+  for(var i=1;i<n;i++){if(tone<=st[i][0]||i===n-1){var a=st[i-1],b=st[i],u=clamp((tone-a[0])/(b[0]-a[0]),0,1);
+    o[0]=a[1][0]+(b[1][0]-a[1][0])*u;o[1]=a[1][1]+(b[1][1]-a[1][1])*u;o[2]=a[1][2]+(b[1][2]-a[1][2])*u;return;}}
+}
+function palAt(ph,tone,o){rampAt(tone,_pa);rotHue(_pa,(ph-Math.floor(ph))*TAU,o);}   // ph: 0..1 = one turn of the wheel
+function bgAt(ph,o){rotHue(BG_BASE,(ph-Math.floor(ph))*TAU,o);}
+
+/* ------------------------------------------------------------------ static geometry */
+/* BODY HULL: icosahedron subdivided once = 42 vertices, 80 flat glass facets.
+   LATTICE:   the same mesh subdivided again = 162 nodes / 480 rods riding on the hull (5- and 6-valent nodes).
+   CORE:      two interpenetrating distorted cuboids (24 facets) carrying most of the grain islands.
+   CAGE:      icosahedron of 12 big pearls / 30 thick rods outside, tied to the lattice by 12 struts. */
+var HV=42,HF=80,HE=120;
+var hDir=new Float64Array(HV*3),hBase=new Float64Array(HV),hE1=new Float64Array(HV*3),hE2=new Float64Array(HV*3);
+var hTK1=new Float64Array(HV),hTK2=new Float64Array(HV),hTP1=new Float64Array(HV),hTP2=new Float64Array(HV),hTA=new Float64Array(HV);
+var hF=new Uint8Array(HF*3),hAdj=new Uint8Array(HF*3),hFDir=new Float64Array(HF*3),hFR=new Float64Array(HF*8);
+var hEd=new Uint8Array(HE*2);
+var fDirS=new Float64Array(HV*3),lR=new Float64Array(HV),tMax=0,hPar=new Uint8Array(HV*2),hSO=new Float64Array(HV*2),hStat=new Float64Array(HV),hObj=new Float64Array(HV*3),hRad=new Float64Array(HV),hObjG=new Float64Array(HV*3),hRadG=new Float64Array(HV),cgNb=[],wFlat;
+var icoEd=[];
+var NN=0,NR=0,rodA,rodB,rodRad,rodK,rodPh,nodeRad,nodeSK,nodeSP,nodeLP,nodeEdge;
+var CN=12,CR=42,cgA=new Int16Array(CR),cgB=new Int16Array(CR),cgK=new Float64Array(CN*3),cgP=new Float64Array(CN*3),cgRK=new Float64Array(CR),cgRP=new Float64Array(CR);
+var KV=16,KQ=12,kHalf=[[0.88,0.76,0.82],[0.68,0.92,0.64]],kNK=new Float64Array(KV*6),kNP=new Float64Array(KV*6),kQ=new Uint8Array(KQ*4),kQAdj=new Uint8Array(KQ*8),kQR=new Float64Array(KQ*8);
+var wRad,wDeep,wFrost,wPatch,wTone,wCoreP;
+
+function buildScene(){
+  var i,j,k,a,b,c;
+  // --- icosahedron, one vertex on the pole
+  var v=[],h=1/Math.sqrt(5),r=2/Math.sqrt(5);
+  v.push([0,1,0]);
+  for(i=0;i<5;i++){a=TAU*i/5;v.push([r*Math.cos(a),h,r*Math.sin(a)]);}
+  for(i=0;i<5;i++){a=TAU*(i+0.5)/5;v.push([r*Math.cos(a),-h,r*Math.sin(a)]);}
+  v.push([0,-1,0]);
+  var f=[];
+  for(i=0;i<5;i++){j=(i+1)%5;f.push([0,1+i,1+j],[1+i,6+i,1+j],[1+j,6+i,6+j],[11,6+j,6+i]);}
+  function orient(F,V){for(var q=0;q<F.length;q++){var A=V[F[q][0]],B=V[F[q][1]],C=V[F[q][2]];
+    var ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2],vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+    var nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+    if(nx*(A[0]+B[0]+C[0])+ny*(A[1]+B[1]+C[1])+nz*(A[2]+B[2]+C[2])<0){var t=F[q][1];F[q][1]=F[q][2];F[q][2]=t;}}}
+  orient(f,v);
+  var seen={};
+  for(i=0;i<f.length;i++)for(j=0;j<3;j++){a=f[i][j];b=f[i][(j+1)%3];k=a<b?a*64+b:b*64+a;if(!seen[k]){seen[k]=1;icoEd.push(a<b?[a,b]:[b,a]);}}
+  // --- 2V subdivision -> hull
+  var cache={},faces=[];
+  function mid(p,q){var key=p<q?p*64+q:q*64+p;if(cache[key]!==undefined)return cache[key];
+    var A=v[p],B=v[q],x=A[0]+B[0],y=A[1]+B[1],z=A[2]+B[2],l=Math.sqrt(x*x+y*y+z*z);v.push([x/l,y/l,z/l]);cache[key]=v.length-1;return cache[key];}
+  for(i=0;i<f.length;i++){a=f[i][0];b=f[i][1];c=f[i][2];var ab=mid(a,b),bc=mid(b,c),ca=mid(c,a);
+    faces.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]);}
+  for(i=0;i<12;i++)cgNb.push([]);
+  for(i=0;i<icoEd.length;i++){var mm=mid(icoEd[i][0],icoEd[i][1]);cgNb[icoEd[i][0]].push(mm);cgNb[icoEd[i][1]].push(mm);hPar[mm*2]=icoEd[i][0];hPar[mm*2+1]=icoEd[i][1];}
+  for(i=0;i<HV;i++){
+    var d=v[i];hDir[i*3]=d[0];hDir[i*3+1]=d[1];hDir[i*3+2]=d[2];
+    hBase[i]=i<12?1.0:0.87;                                   // puffed icosahedron: big, nearly planar gem faces
+    var ax=Math.abs(d[1])>0.9?1:0,ay=Math.abs(d[1])>0.9?0:1,az=0;
+    var ex=d[1]*az-d[2]*ay,ey=d[2]*ax-d[0]*az,ez=d[0]*ay-d[1]*ax,l=Math.sqrt(ex*ex+ey*ey+ez*ez);ex/=l;ey/=l;ez/=l;
+    hE1[i*3]=ex;hE1[i*3+1]=ey;hE1[i*3+2]=ez;
+    hE2[i*3]=d[1]*ez-d[2]*ey;hE2[i*3+1]=d[2]*ex-d[0]*ez;hE2[i*3+2]=d[0]*ey-d[1]*ex;
+    hTK1[i]=ri(6,30);hTK2[i]=ri(6,30);hTP1[i]=rr(0,TAU);hTP2[i]=rr(0,TAU);hTA[i]=i<12?0.09:0.12;hSO[i*2]=rr(-1,1)*(i<12?0.10:0.15);hSO[i*2+1]=rr(-1,1)*(i<12?0.10:0.15);hStat[i]=rr(-0.35,0.35);
+  }
+  for(i=0;i<HV;i++){      // the steady frame: fixed, slightly irregular node directions and radii
+    var q3=i*3,sx_=hDir[q3]+hE1[q3]*hSO[i*2]+hE2[q3]*hSO[i*2+1],sy_=hDir[q3+1]+hE1[q3+1]*hSO[i*2]+hE2[q3+1]*hSO[i*2+1],sz_=hDir[q3+2]+hE1[q3+2]*hSO[i*2]+hE2[q3+2]*hSO[i*2+1],sl_=Math.sqrt(sx_*sx_+sy_*sy_+sz_*sz_);
+    fDirS[q3]=sx_/sl_;fDirS[q3+1]=sy_/sl_;fDirS[q3+2]=sz_/sl_;lR[i]=(i<12?1.04:0.95)+rr(-0.022,0.022);
+  }
+  var ekey={},ne=0,eFaces=[];
+  function edgeId(p,q){var key=p<q?p*64+q:q*64+p;if(ekey[key]===undefined){ekey[key]=ne;hEd[ne*2]=Math.min(p,q);hEd[ne*2+1]=Math.max(p,q);eFaces.push([]);ne++;}return ekey[key];}
+  for(i=0;i<HF;i++){
+    var F=faces[i];hF[i*3]=F[0];hF[i*3+1]=F[1];hF[i*3+2]=F[2];
+    for(j=0;j<3;j++){var e=edgeId(F[(j+1)%3],F[(j+2)%3]);eFaces[e].push([i,j]);}   // local edge j is opposite vertex j
+    var x=v[F[0]][0]+v[F[1]][0]+v[F[2]][0],y=v[F[0]][1]+v[F[1]][1]+v[F[2]][1],z=v[F[0]][2]+v[F[1]][2]+v[F[2]][2],l2=Math.sqrt(x*x+y*y+z*z);
+    hFDir[i*3]=x/l2;hFDir[i*3+1]=y/l2;hFDir[i*3+2]=z/l2;
+    hFR[i*8]=rr(-1,1);hFR[i*8+1]=rr(-1,1);hFR[i*8+2]=rr(0,8);hFR[i*8+3]=rr(0,8);hFR[i*8+4]=rr(-1,1);hFR[i*8+5]=ri(4,14);hFR[i*8+6]=rr(0,TAU);hFR[i*8+7]=rr(0,1);
+  }
+  for(e=0;e<HE;e++){var A=eFaces[e][0],B=eFaces[e][1];hAdj[A[0]*3+A[1]]=B[0];hAdj[B[0]*3+B[1]]=A[0];}
+  // --- FOLD SEQUENCE: one section at a time. Each 2.5 s step exactly one of the 12 corners folds in (dent) or back out,
+  //     its five surrounding panels hinging with it; the next fold starts only when this one has locked. Mostly
+  //     camera-facing corners, so the viewer sees each fold. 120 folds, then the same 120 again (each corner toggles an
+  //     even number of times -> the shape is back where it started at 600 s: exact loop).
+  (function(){
+    var st=[],last=-1,prev=-1,half=[],n,i;
+    for(i=0;i<12;i++){foldIn[i]=rr(0.78,0.86);foldOut[i]=rr(1.02,1.10);st[i]=rnd()<0.5?1:0;}
+    for(n=0;n<120;n++){
+      var c;do{c=ri(0,11);}while(c===last||c===prev||(hDir[c*3+2]<-0.15&&rnd()<0.8));
+      half.push(c);prev=last;last=c;
+    }
+    var sch=half.concat(half);
+    for(n=0;n<=NSTEP;n++){for(i=0;i<12;i++)foldS[n*12+i]=st[i]?foldOut[i]:foldIn[i];if(n<NSTEP)st[sch[n]]^=1;}
+  })();
+  // --- lattice
+  var rods=[];
+  if(OPT.lat===162){
+    NN=HV+HE;
+    for(e=0;e<HE;e++){rods.push([hEd[e*2],HV+e,0],[HV+e,hEd[e*2+1],0]);}
+    for(i=0;i<HF;i++){var e0=edgeId(hF[i*3],hF[i*3+1]),e1=edgeId(hF[i*3+1],hF[i*3+2]),e2=edgeId(hF[i*3+2],hF[i*3]);
+      rods.push([HV+e0,HV+e1,1],[HV+e1,HV+e2,1],[HV+e2,HV+e0,1]);}
+  }else{
+    NN=HV;for(e=0;e<HE;e++)rods.push([hEd[e*2],hEd[e*2+1],0]);
+  }
+  NR=rods.length;
+  rodA=new Uint16Array(NR);rodB=new Uint16Array(NR);rodRad=new Float64Array(NR);rodK=new Float64Array(NR);rodPh=new Float64Array(NR);
+  var fine=OPT.lat===162;
+  for(i=0;i<NR;i++){rodA[i]=rods[i][0];rodB[i]=rods[i][1];rodRad[i]=fine?(rods[i][2]?0.0036:0.0042):0.0046;rodK[i]=ri(4,8);rodPh[i]=rr(0,1);}
+  nodeRad=new Float64Array(NN);nodeSK=new Float64Array(NN);nodeSP=new Float64Array(NN);nodeLP=new Float64Array(NN);
+  for(i=0;i<NN;i++){nodeRad[i]=fine?(i<12?0.0245:i<HV?0.0225:0.0195):(i<12?0.027:0.024);nodeSK[i]=ri(12,36);nodeSP[i]=rr(0,TAU);nodeLP[i]=rr(0,TAU);}
+  // --- outer cage (icosahedron + struts)
+  for(i=0;i<30;i++){cgA[i]=icoEd[i][0];cgB[i]=icoEd[i][1];}
+  for(i=0;i<12;i++){cgA[30+i]=i;cgB[30+i]=-1-i;}            // strut: cage node i -> lattice node i
+  for(i=0;i<CN;i++){cgK[i*3]=ri(55,115);cgK[i*3+1]=ri(55,115);cgK[i*3+2]=ri(60,110);cgP[i*3]=rr(0,TAU);cgP[i*3+1]=rr(0,TAU);cgP[i*3+2]=rr(0,TAU);}
+  for(i=0;i<CR;i++){cgRK[i]=ri(3,6);cgRP[i]=rr(0,1);}
+  // --- core cuboids
+  var QF=[[1,3,7,5],[0,4,6,2],[2,6,7,3],[0,1,5,4],[4,5,7,6],[0,2,3,1]];
+  for(c=0;c<2;c++)for(i=0;i<6;i++)for(j=0;j<4;j++)kQ[(c*6+i)*4+j]=c*8+QF[i][j];
+  for(c=0;c<2;c++)for(i=0;i<6;i++){                            // orient each quad outward
+    var q=(c*6+i)*4,P=[];for(j=0;j<4;j++){var ci=kQ[q+j]-c*8;P.push([(ci&1)?1:-1,(ci&2)?1:-1,(ci&4)?1:-1]);}
+    var ux=P[1][0]-P[0][0],uy=P[1][1]-P[0][1],uz=P[1][2]-P[0][2],wx=P[2][0]-P[0][0],wy=P[2][1]-P[0][1],wz=P[2][2]-P[0][2];
+    var nx=uy*wz-uz*wy,ny=uz*wx-ux*wz,nz=ux*wy-uy*wx,mx=P[0][0]+P[2][0],my=P[0][1]+P[2][1],mz=P[0][2]+P[2][2];
+    if(nx*mx+ny*my+nz*mz<0){var t=kQ[q+1];kQ[q+1]=kQ[q+3];kQ[q+3]=t;}
+  }
+  for(i=0;i<KQ;i++)for(j=0;j<4;j++){                           // quad edge j = corners j,j+1 -> neighbour quad + its edge
+    a=kQ[i*4+j];b=kQ[i*4+(j+1)%4];
+    for(k=0;k<KQ;k++){if(k===i)continue;for(var m=0;m<4;m++){var p=kQ[k*4+m],q2=kQ[k*4+(m+1)%4];if((p===a&&q2===b)||(p===b&&q2===a)){kQAdj[(i*4+j)*2]=k;kQAdj[(i*4+j)*2+1]=m;}}}
+  }
+  for(i=0;i<KV*6;i++){kNK[i]=ri(6,30);kNP[i]=rr(0,TAU);}
+  for(i=0;i<KQ;i++){kQR[i*8]=rr(-1,1);kQR[i*8+1]=rr(-1,1);kQR[i*8+2]=rr(0,8);kQR[i*8+3]=rr(0,8);kQR[i*8+4]=rr(-1,1);kQR[i*8+5]=ri(4,12);kQR[i*8+6]=rr(0,TAU);kQR[i*8+7]=rr(0,1);}
+  // --- periodic fields
+  wRad=makeWaves([3,7,11,16,22,29,37,13],[0.22,0.30,0.32,0.30,0.24,0.20,0.14,0.14],0.9,2.4);
+  wFlat=makeWaves([4,9,14],[1,1,0.8],1.0,2.2);
+  wRad.qx[7]*=2.2;wRad.qy[7]*=2.2;wRad.qz[7]*=2.2;            // one finer wave so neighbouring vertices fold against each other
+  wDeep=makeWaves([3,5,8],[1,1,1],1.2,2.0);
+  wFrost=makeWaves([4,6,9],[1,1,1],1.0,1.8);
+  wPatch=makeWaves([3,4,7],[1,1,1],1.6,2.8);
+  wTone=makeWaves([5,7,10],[1,1,1],1.5,2.6);
+  wCoreP=makeWaves([3,5,6],[1,1,1],1.2,2.4);
+}
+
+/* ------------------------------------------------------------------ dynamic state + buffers */
+var fDeep=new Float64Array(HF),fSort=new Float64Array(HF);
+var hv=new Float64Array(HV*3),hHeat=new Float64Array(HV),fN=new Float64Array(HF*3),fC=new Float64Array(HF*3),fFront=new Uint8Array(HF),ordBack=new Int16Array(HF),ordFront=new Int16Array(HF);
+var ln,lHeat,ordJoint,ordJointKey;
+var cg=[new Float64Array(CN*3),new Float64Array(CN*3),new Float64Array(CN*3),new Float64Array(CN*3)],cgHeat=new Float64Array(CN),cgKey=new Float64Array(CR),cgOrd=new Int16Array(CR),cgJOrd=new Int16Array(CN),cgJKey=new Float64Array(CN);
+var kv=new Float64Array(KV*3),kTri=new Int16Array(24*3),kTN=new Float64Array(24*3),kTFront=new Uint8Array(24),kTW=new Float64Array(24*3),kTQ=new Uint8Array(24),kEF=new Uint8Array(KQ*4),kEdgeOf=new Int8Array(24*3),kFrame=new Float64Array(KQ*9);
+var FSTR=31,RSTR=14,JSTR=11;
+var facetData=new Float32Array((HF+24)*3*FSTR),rodData,jointData;
+var NGHOST=3,GHOST_DT=0.105;
+var draws={backFirst:0,backCount:0,coreFirst:0,coreCount:0,frontFirst:0,frontCount:0,latRods:0,cgGhostRods:0,cgRodFar:0,cgRodNear:0,latJoints:0,cgGhostJoints:0,cgJFar:0,cgJNear:0};
+var MH=new Float64Array(9),MA=new Float64Array(9),MB=new Float64Array(9),mT1=new Float64Array(9),mT2=new Float64Array(9),mT3=new Float64Array(9);
+var LX=0,LY=1,LZ=0;
+var S={W:2,H:2,cw:2,ch:2,cssW:1,cssH:1,f:1,ppu:1,px:1,oy:0};
+/* touch + orbit state (animation clock, never tied to the scene clock) */
+var WK=16,wkN=[],wkX=new Float64Array(WK),wkY=new Float64Array(WK),wkDx=new Float64Array(WK),wkDy=new Float64Array(WK),wkS=new Float64Array(WK),wkAge=new Float64Array(WK),wkUni=new Float32Array(WK*3),wkHead=0,nWake=0,WK_LIFE=2.2;
+for(var _w=0;_w<WK;_w++)wkN.push({x:0,y:0,dx:1,dy:0,s:0,born:-99});
+var TN=5,tch=[],tX=new Float64Array(TN),tY=new Float64Array(TN),tS=new Float64Array(TN),tUni=new Float32Array(TN*3),nActiveT=0,ripPh=0;
+for(var _i=0;_i<TN;_i++)tch.push({id:-1,on:false,x:0,y:0,sx:0,sy:0,s:0});
+var orb={yaw:0,pitch:0,vy:0,vp:0,drag:-1,dx:0,dy:0};
+
+function allocDynamic(){
+  ln=new Float64Array(NN*3);lHeat=new Float64Array(NN);ordJoint=new Int16Array(NN);ordJointKey=new Float64Array(NN);
+  for(var i=0;i<NN;i++)ordJoint[i]=i;
+  for(i=0;i<CR;i++)cgOrd[i]=i;for(i=0;i<CN;i++)cgJOrd[i]=i;
+  rodData=new Float32Array((NR+CR*(NGHOST+1))*4*RSTR);
+  jointData=new Float32Array((NN+CN*(NGHOST+1))*4*JSTR);
+}
+function sortIdx(ord,n,key){for(var i=1;i<n;i++){var v=ord[i],k=key[v],j=i-1;while(j>=0&&key[ord[j]]>k){ord[j+1]=ord[j];j--;}ord[j+1]=v;}}
+
+/* gravity wells: pull toward each finger, outward travelling ripple, plus a soft radial limiter */
+var WX=0,WY=0,WZ=0,WH=0;
+function warp(x,y,z,rs,rm){
+  var h=0;
+  if(nActiveT>0||nWake>0){
+    var ox=0,oy=0,oz=0,zz=-z,k,s;
+    /* fluid wake behind a moving finger: each node shoves matter sideways out of an ellipse stretched along
+       the stroke, drags it a little forward and spins a counter-rotating eddy on either side */
+    for(k=0;k<WK;k++){s=wkS[k];if(s<0.003)continue;
+      var ex=x-wkX[k]*zz,ey=y-wkY[k]*zz,al=ex*wkDx[k]+ey*wkDy[k],pe=-ex*wkDy[k]+ey*wkDx[k];
+      var q2=al*al*4.2+pe*pe*18.0;if(q2>=1)continue;
+      var qq=Math.sqrt(q2),w=(1-qq*qq*(3-2*qq))*s,sd=pe/(Math.abs(pe)+0.05),cu=sd*0.80*(0.65+0.35*Math.sin(wkAge[k]*5.0+k));
+      ox+=-wkDy[k]*sd*w*0.15+wkDx[k]*w*0.06-ey*w*cu;oy+=wkDx[k]*sd*w*0.15+wkDy[k]*w*0.05+ex*w*cu;oz+=w*0.06;
+      h+=w*0.85;
+    }
+    for(k=0;k<TN;k++){s=tS[k];if(s<0.002)continue;
+      var dx=tX[k]*zz-x,dy=tY[k]*zz-y,d2=dx*dx+dy*dy,d=Math.sqrt(d2);
+      var g=Math.exp(-d2*3.2),dec=Math.exp(-d*1.6),sw=Math.sin(TAU*(d*2.1-ripPh-k*0.21));
+      var rip=s*0.036*sw*dec*(1-Math.exp(-d2*40)),pull=s*0.50*g,id=d>1e-6?1/d:0;
+      ox+=dx*pull-dx*id*rip;oy+=dy*pull-dy*id*rip;oz+=s*0.16*g+rip*0.8;
+      h+=s*(g*0.9+(0.5+0.5*sw)*dec*0.35);
+    }
+    x+=ox;y+=oy;z+=oz;
+  }
+  var rx=x-CX,ry=y-CY,rz=z-CZ,r=Math.sqrt(rx*rx+ry*ry+rz*rz);
+  if(r>rs){var r2=rs+(rm-rs)*(1-Math.exp(-(r-rs)/(rm-rs))),q=r2/r;x=CX+rx*q;y=CY+ry*q;z=CZ+rz*q;}
+  WX=x;WY=y;WZ=z;WH=h>1.4?1.4:h;
+}
+/* distance from the body centre to the hull along a unit direction (hull is star-shaped) */
+function hullDist(ux,uy,uz){
+  for(var f=0;f<HF;f++){
+    var a=hF[f*3]*3,b=hF[f*3+1]*3,c=hF[f*3+2]*3;
+    var ax=hv[a],ay=hv[a+1],az=hv[a+2];
+    var e1x=hv[b]-ax,e1y=hv[b+1]-ay,e1z=hv[b+2]-az,e2x=hv[c]-ax,e2y=hv[c+1]-ay,e2z=hv[c+2]-az;
+    var px=uy*e2z-uz*e2y,py=uz*e2x-ux*e2z,pz=ux*e2y-uy*e2x;
+    var det=e1x*px+e1y*py+e1z*pz;if(det>-1e-9&&det<1e-9)continue;
+    var inv=1/det,sx=CX-ax,sy=CY-ay,sz=CZ-az;
+    var u=(sx*px+sy*py+sz*pz)*inv;if(u<-1e-5||u>1.00001)continue;
+    var qx=sy*e1z-sz*e1y,qy=sz*e1x-sx*e1z,qz=sx*e1y-sy*e1x;
+    var w=(ux*qx+uy*qy+uz*qz)*inv;if(w<-1e-5||u+w>1.00001)continue;
+    var t=(e2x*qx+e2y*qy+e2z*qz)*inv;if(t>1e-4)return t;
+  }
+  return 0.85;
+}
+/* every hull crossing of a ray: RN nearest, RF farthest, RC count (used for glass thickness and cast shadow) */
+var RN=0,RF=0,RC=0;
+function rayHull(ox,oy,oz,dx,dy,dz,tmin){
+  RN=1e9;RF=-1e9;RC=0;
+  for(var f=0;f<HF;f++){
+    var a=hF[f*3]*3,b=hF[f*3+1]*3,c=hF[f*3+2]*3;
+    var ax=hv[a],ay=hv[a+1],az=hv[a+2];
+    var e1x=hv[b]-ax,e1y=hv[b+1]-ay,e1z=hv[b+2]-az,e2x=hv[c]-ax,e2y=hv[c+1]-ay,e2z=hv[c+2]-az;
+    var px=dy*e2z-dz*e2y,py=dz*e2x-dx*e2z,pz=dx*e2y-dy*e2x;
+    var det=e1x*px+e1y*py+e1z*pz;if(det>-1e-9&&det<1e-9)continue;
+    var inv=1/det,sx=ox-ax,sy=oy-ay,sz=oz-az;
+    var u=(sx*px+sy*py+sz*pz)*inv;if(u<-1e-4||u>1.0001)continue;
+    var qx=sy*e1z-sz*e1y,qy=sz*e1x-sx*e1z,qz=sx*e1y-sy*e1x;
+    var w=(dx*qx+dy*qy+dz*qz)*inv;if(w<-1e-4||u+w>1.0001)continue;
+    var t=(e2x*qx+e2y*qy+e2z*qz)*inv;if(t>tmin){RC++;if(t<RN)RN=t;if(t>RF)RF=t;}
+  }
+}
+var thH=new Float64Array(HV),dpH=new Float64Array(HV),shH=new Float64Array(HV),dpK=new Float64Array(KV),shK=new Float64Array(KV);
+/* HEARTBEAT: lub ... dub (0.30 s later, 60 %) ... rest, 72 per minute. Phase = fract(t*1.2), i.e. k = 720 of 2PI/600,
+   so it is exactly periodic inside the 600 s loop. Each beat: ~70 ms attack, ~0.1 s time-constant decay. */
+function pulse(x){if(x<0)return 0;if(x<0.07){var u=x/0.07;return u*u*(3-2*u);}return Math.exp(-(x-0.07)/0.10);}
+function beat(t){var p=t*1.2;p-=Math.floor(p);var x=p/1.2,T=1/1.2;return pulse(x)+0.6*pulse(x-0.30)+pulse(x+T)+0.6*pulse(x+T-0.30);}
+function beatAge(t){var p=t*1.2;p-=Math.floor(p);return p/1.2;}
+function breath(t){return 1+0.022*Math.sin(75*W0*t)+0.036*beat(t)*(1+0.3*tMax);}      // plates: slow breath + heartbeat swell
+function frameBreath(t){return 1+0.012*Math.sin(30*W0*t)+0.004*beat(t);}             // lattice + cage: nearly steady
+/* hull in object space at time t: 12 lobe vertices swing +-19 % on low-frequency waves; the 30 in-between
+   vertices sink toward the chord plane (big flat planes) or puff out (small facets) under a second field;
+   static + drifting tangential offsets make the facets unequal in size */
+/* MECHANICAL INDEXING: the plates and the inner blocks do not drift, they 'click': each 2.5 s step is a 0.9 s eased move,
+   then a lock and hold. Stepped time maps [0,600] onto itself monotonically (240 steps), so the 600 s loop stays exact. */
+var STEP=2.5,MOVE=0.36;
+var FROST_MIN=clamp(qn('frost',0.40),0,0.95),thrA=new Float64Array(80),covW=new Float64Array(80),thrShift=0,lastCov=0,mSorted=null;
+/* coverage of the frost mask for a threshold = share of mask samples above it (measured once from the real texture) */
+function mCov(th){if(!mSorted)return 0.5;var lo=0,hi=mSorted.length;while(lo<hi){var m=(lo+hi)>>1;if(mSorted[m]<=th)lo=m+1;else hi=m;}return 1-lo/mSorted.length;}
+function lockAge(t,ph){var u=t/STEP+ph;return (u-Math.floor(u)-MOVE)*STEP;}                  // s since this block locked (<0 = moving)
+function jolt(a){return a<0?0:Math.exp(-a*7.0)*Math.sin(a*38.0);}                            // clunk: overshoot + ~0.4 s rattle
+function drag(t,ph){var u=t/STEP+ph,f=(u-Math.floor(u))/MOVE;return f<1?Math.sin(Math.PI*f):0;}  // friction while the other turns
+var NSTEP=240,foldIn=new Float64Array(12),foldOut=new Float64Array(12),foldS=new Float64Array((NSTEP+1)*12);
+function foldR(i,t){var u=t/STEP,n=Math.floor(u),f=(u-n)/MOVE;f=f<0?0:f>1?1:f;f=f*f*f*(f*(f*6-15)+10);n=((n%NSTEP)+NSTEP)%NSTEP;var a=foldS[n*12+i];return a+(foldS[(n+1)*12+i]-a)*f;}
+function stepT(t,ph){var u=t/STEP+ph,n=Math.floor(u),f=(u-n)/MOVE;f=f<0?0:f>1?1:f;f=f*f*f*(f*(f*6-15)+10);return (n+f-ph)*STEP;}
+function hullObj(t0,P,Rr){
+  var br=breath(t0)*(1+0.010*(jolt(lockAge(t0,0.5))+jolt(lockAge(t0,0.0)))),t=stepT(t0,0.0);   // each lock sends a shudder through the skin   // breath + heartbeat stay alive (real time); the shape indexes
+  for(var i=0;i<HV;i++){
+    var i3=i*3,a1=hSO[i*2]+hTA[i]*Math.sin(hTK1[i]*W0*t+hTP1[i]),a2=hSO[i*2+1]+hTA[i]*Math.sin(hTK2[i]*W0*t+hTP2[i]);
+    var dx=hDir[i3]+hE1[i3]*a1+hE2[i3]*a2,dy=hDir[i3+1]+hE1[i3+1]*a1+hE2[i3+1]*a2,dz=hDir[i3+2]+hE1[i3+2]*a1+hE2[i3+2]*a2;
+    var n=wav(wRad,hDir[i3],hDir[i3+1],hDir[i3+2],t)+hStat[i],r;
+    if(i<12)r=foldR(i,t0)+0.02*Math.tanh(n);   // ANGLES + FOLDS: each corner sits folded-in or out; one folds per step
+    else{var F=0.5+0.5*Math.tanh(1.5*wav(wFlat,hDir[i3],hDir[i3+1],hDir[i3+2],t));r=0.5*(Rr[hPar[i*2]]+Rr[hPar[i*2+1]])/br*(0.84+0.05*F)*(0.99+0.02*Math.tanh(n));/* mid corners sit on / just under the chord: flat planes + crisp V-seams */if(r>0.87)r=0.87+0.07*Math.tanh((r-0.87)/0.07);}   // in-between vertices ride the chord of their two lobes: big slanted planes, never a star
+    r*=br;Rr[i]=r;r/=Math.sqrt(dx*dx+dy*dy+dz*dz);P[i3]=dx*r;P[i3+1]=dy*r;P[i3+2]=dz*r;
+  }
+}
+function hullMatrix(t,o){
+  var yaw=0.20*Math.sin(60*W0*t)+0.10*Math.sin(23*W0*t+0.7)+orb.yaw;   // holds its face to the viewer: slow rock, no spin
+  var pit=TILT0+0.05*Math.sin(7*W0*t+1.1)+orb.pitch;
+  var rol=0.065*Math.sin(9*W0*t+2.3);
+  m3rx(pit,mT1);m3rz(rol,mT2);m3mul(mT1,mT2,mT3);m3ry(yaw,mT2);m3mul(mT3,mT2,o);
+}
+var MG=new Float64Array(9);
+function cageNodes(t,M,out,wantHeat){
+  var b=frameBreath(t);
+  for(var i=0;i<CN;i++){
+    var i3=i*3,a1=0.022*Math.sin(cgK[i3]*W0*t+cgP[i3]),a2=0.022*Math.sin(cgK[i3+1]*W0*t+cgP[i3+1]);
+    var dx=fDirS[i3]+hE1[i3]*a1+hE2[i3]*a2,dy=fDirS[i3+1]+hE1[i3+1]*a1+hE2[i3+1]*a2,dz=fDirS[i3+2]+hE1[i3+2]*a1+hE2[i3+2]*a2;
+    var rc=CAGE_R*b*(1+0.006*Math.sin(cgK[i3+2]*W0*t+cgP[i3+2])),rq=hRad[i];for(var nb=0;nb<cgNb[i].length;nb++)rq=Math.max(rq,hRad[cgNb[i][nb]]);rq+=0.10;   // keep >= 0.11 clearance over its lobe:
+    rc=0.5*(rc+rq+Math.sqrt((rc-rq)*(rc-rq)+0.0016));                               // smooth max -> a swelling body pushes the cage out, never through it
+    var r=rc/Math.sqrt(dx*dx+dy*dy+dz*dz);
+    dx*=r;dy*=r;dz*=r;
+    warp(M[0]*dx+M[1]*dy+M[2]*dz+CX,M[3]*dx+M[4]*dy+M[5]*dz+CY,M[6]*dx+M[7]*dy+M[8]*dz+CZ,1.24,1.27);
+    out[i3]=WX;out[i3+1]=WY;out[i3+2]=WZ;if(wantHeat)cgHeat[i]=WH;
+  }
+}
+
+/* write one flat facet (3 vertices x 31 floats) */
+var _sx=new Float64Array(3),_sy=new Float64Array(3),_al=new Float64Array(3);
+function emitTri(o,P,i0,i1,i2,nx,ny,nz,ox,oy,oz,tqx,tqy,tqz,bqx,bqy,bqz,w0,w1,w2,d0,d1,d2,d3,e0,e1,e2,e3,TA,SA){
+  var D=facetData,dt=tqx*nx+tqy*ny+tqz*nz,tx=tqx-dt*nx,ty=tqy-dt*ny,tz=tqz-dt*nz,il=1/Math.sqrt(tx*tx+ty*ty+tz*tz);tx*=il;ty*=il;tz*=il;
+  var bx=ny*tz-nz*ty,by=nz*tx-nx*tz,bz=nx*ty-ny*tx;
+  var ltx=LX*tx+LY*ty+LZ*tz,lty=LX*bx+LY*by+LZ*bz,ltz=LX*nx+LY*ny+LZ*nz;
+  var f=S.f,v,ix,x,y,z,tm=(TA[i0]+TA[i1]+TA[i2])*0.2167,sm2=(SA[i0]+SA[i1]+SA[i2])*0.15;   // plate-wise shade: 65 % plate mean + 35 % local
+  for(v=0;v<3;v++){ix=(v===0?i0:v===1?i1:i2)*3;z=-f/P[ix+2];_sx[v]=P[ix]*z;_sy[v]=P[ix+1]*z;}
+  var ar=Math.abs((_sx[1]-_sx[0])*(_sy[2]-_sy[0])-(_sy[1]-_sy[0])*(_sx[2]-_sx[0]));
+  _al[0]=ar/Math.max(Math.sqrt((_sx[2]-_sx[1])*(_sx[2]-_sx[1])+(_sy[2]-_sy[1])*(_sy[2]-_sy[1])),1e-6);
+  _al[1]=ar/Math.max(Math.sqrt((_sx[2]-_sx[0])*(_sx[2]-_sx[0])+(_sy[2]-_sy[0])*(_sy[2]-_sy[0])),1e-6);
+  _al[2]=ar/Math.max(Math.sqrt((_sx[1]-_sx[0])*(_sx[1]-_sx[0])+(_sy[1]-_sy[0])*(_sy[1]-_sy[0])),1e-6);
+  for(v=0;v<3;v++){
+    ix=(v===0?i0:v===1?i1:i2)*3;x=P[ix];y=P[ix+1];z=P[ix+2];
+    il=1/Math.sqrt(x*x+y*y+z*z);var vx=-x*il,vy=-y*il,vz=-z*il;
+    var hx=LX+vx,hy=LY+vy,hz=LZ+vz;il=1/Math.sqrt(hx*hx+hy*hy+hz*hz);hx*=il;hy*=il;hz*=il;
+    D[o]=x;D[o+1]=y;D[o+2]=z;
+    D[o+3]=(x-ox)*tqx+(y-oy)*tqy+(z-oz)*tqz;D[o+4]=(x-ox)*bqx+(y-oy)*bqy+(z-oz)*bqz;D[o+5]=y-CY;D[o+6]=nx*vx+ny*vy+nz*vz;
+    D[o+7]=v===0?_al[0]:0;D[o+8]=v===1?_al[1]:0;D[o+9]=v===2?_al[2]:0;D[o+10]=nx;
+    D[o+11]=w0;D[o+12]=w1;D[o+13]=w2;D[o+14]=ny;
+    D[o+15]=d0;D[o+16]=d1;D[o+17]=d2;D[o+18]=d3;
+    D[o+19]=e0;D[o+20]=e1;D[o+21]=e2;D[o+22]=e3;
+    D[o+23]=ltx;D[o+24]=lty;D[o+25]=ltz;D[o+26]=sm2+0.55*SA[ix/3];
+    D[o+27]=hx*tx+hy*ty+hz*tz;D[o+28]=hx*bx+hy*by+hz*bz;D[o+29]=hx*nx+hy*ny+hz*nz;D[o+30]=tm+0.35*TA[ix/3];
+    o+=FSTR;
+  }
+  return o;
+}
+function putRod(o,ax,ay,az,bx,by,bz,rad,blur,glint,heat,alpha,kind){
+  var D=rodData;
+  for(var v=0;v<4;v++){D[o]=ax;D[o+1]=ay;D[o+2]=az;D[o+3]=bx;D[o+4]=by;D[o+5]=bz;D[o+6]=(v&1)?1:-1;D[o+7]=v>>1;D[o+8]=rad;D[o+9]=blur;D[o+10]=glint;D[o+11]=heat;D[o+12]=alpha;D[o+13]=kind;o+=RSTR;}
+  return o;
+}
+function putJoint(o,x,y,z,rad,blur,heat,alpha,kind,seed){
+  var D=jointData;
+  for(var v=0;v<4;v++){D[o]=x;D[o+1]=y;D[o+2]=z;D[o+3]=(v&1)?1:-1;D[o+4]=(v&2)?1:-1;D[o+5]=rad;D[o+6]=blur;D[o+7]=heat;D[o+8]=alpha;D[o+9]=kind;D[o+10]=seed;o+=JSTR;}
+  return o;
+}
+
+/* ------------------------------------------------------------------ per-frame geometry (all on the CPU, tiny) */
+function computeFrame(t){
+  var i,j,k,i3,o,x,y,z,l,a,b,c;
+  var br=breath(t);
+  // key light from above-front, swaying a little so facets and sparkles catch it in turn
+  x=-0.32+0.12*Math.sin(6*W0*t);y=0.80;z=0.50+0.06*Math.cos(6*W0*t);l=Math.sqrt(x*x+y*y+z*z);LX=x/l;LY=y/l;LZ=z/l;
+  hullMatrix(t,MH);
+  hullObj(t,hObj,hRad);
+  // ---- hull vertices: tangential drift + radial morph (+-16.5 %, soft-limited) + breathing
+  for(i=0;i<HV;i++){
+    i3=i*3;
+    var dx=hObj[i3],dy=hObj[i3+1],dz=hObj[i3+2];
+    warp(MH[0]*dx+MH[1]*dy+MH[2]*dz+CX,MH[3]*dx+MH[4]*dy+MH[5]*dz+CY,MH[6]*dx+MH[7]*dy+MH[8]*dz+CZ,1.09,1.12);
+    hv[i3]=WX;hv[i3+1]=WY;hv[i3+2]=WZ;hHeat[i]=WH;
+  }
+  // ---- hull facets: normals, facing
+  var nb=0,nf=0;
+  for(i=0;i<HF;i++){
+    i3=i*3;a=hF[i3]*3;b=hF[i3+1]*3;c=hF[i3+2]*3;
+    var ux=hv[b]-hv[a],uy=hv[b+1]-hv[a+1],uz=hv[b+2]-hv[a+2],vx=hv[c]-hv[a],vy=hv[c+1]-hv[a+1],vz=hv[c+2]-hv[a+2];
+    x=uy*vz-uz*vy;y=uz*vx-ux*vz;z=ux*vy-uy*vx;l=1/Math.sqrt(x*x+y*y+z*z);x*=l;y*=l;z*=l;
+    fN[i3]=x;fN[i3+1]=y;fN[i3+2]=z;
+    var cx=(hv[a]+hv[b]+hv[c])/3,cy=(hv[a+1]+hv[b+1]+hv[c+1])/3,cz=(hv[a+2]+hv[b+2]+hv[c+2])/3;
+    fC[i3]=cx;fC[i3+1]=cy;fC[i3+2]=cz;
+    fFront[i]=(x*cx+y*cy+z*cz)<0?1:0;
+    if(fFront[i])ordFront[nf++]=i;else ordBack[nb++]=i;
+  }
+  // glass thickness along the view ray + light path through the body, per hull vertex
+  for(i=0;i<HV;i++){
+    i3=i*3;x=hv[i3];y=hv[i3+1];z=hv[i3+2];l=Math.sqrt(x*x+y*y+z*z);
+    rayHull(0,0,0,x/l,y/l,z/l,0.5);
+    thH[i]=RC?Math.max(RF-l,0):0;dpH[i]=RC?Math.max(l-RN,0):0;
+    var qx=x-CX,qy=y-CY,qz=z-CZ,ql=0.03/Math.sqrt(qx*qx+qy*qy+qz*qz);
+    rayHull(x+qx*ql,y+qy*ql,z+qz*ql,LX,LY,LZ,0.012);
+    shH[i]=RC?1-Math.exp(-2.4*(RC>1?RF-RN:RF)):0;
+  }
+  // back faces far -> near
+  for(i=1;i<nb;i++){var vi=ordBack[i],kz=fC[vi*3+2];j=i-1;while(j>=0&&fC[ordBack[j]*3+2]>kz){ordBack[j+1]=ordBack[j];j--;}ordBack[j+1]=vi;}
+  // a few (about 7 of 80) deep translucent facets at any time: adaptive threshold = 8th largest field value (continuous in time)
+  var tS=stepT(t,0.0);
+  for(i=0;i<HF;i++){fDeep[i]=wav(wDeep,hFDir[i*3],hFDir[i*3+1],hFDir[i*3+2],tS)/3;fSort[i]=fDeep[i];}
+  for(i=0;i<11;i++){var mi=i;for(j=i+1;j<HF;j++)if(fSort[j]>fSort[mi])mi=j;var tv=fSort[i];fSort[i]=fSort[mi];fSort[mi]=tv;}
+  var dth=fSort[10];
+  // FROST FLOOR: the drifting patches may wander, but total frost coverage never drops below 40 %. When the drift would
+  // thin it out, every patch's threshold slides down together (variety kept: panels can still be plain glass)
+  var covSum=0,nF=0;   // measured on what you actually see: facing panels, weighted by their on-screen size
+  for(i=0;i<HF;i++){thrA[i]=0.53-0.36*wav(wPatch,hFDir[i*3],hFDir[i*3+1],hFDir[i*3+2],t)/3+0.08*hFR[i*8+4];covW[i]=0;
+    if(fFront[i]){var A_=hF[i*3]*3,B_=hF[i*3+1]*3,C_=hF[i*3+2]*3,ux_=hv[B_]-hv[A_],uy_=hv[B_+1]-hv[A_+1],uz_=hv[B_+2]-hv[A_+2],vx_=hv[C_]-hv[A_],vy_=hv[C_+1]-hv[A_+1],vz_=hv[C_+2]-hv[A_+2];
+      var cx_=uy_*vz_-uz_*vy_,cy_=uz_*vx_-ux_*vz_,cz_=ux_*vy_-uy_*vx_,cl_=Math.sqrt(fC[i*3]*fC[i*3]+fC[i*3+1]*fC[i*3+1]+fC[i*3+2]*fC[i*3+2]);
+      covW[i]=Math.max(-(cx_*fC[i*3]+cy_*fC[i*3+1]+cz_*fC[i*3+2])/cl_,0)/(cl_*cl_);covSum+=covW[i]*mCov(thrA[i]);nF+=covW[i];}}
+  nF=Math.max(nF,1e-9);thrShift=0;lastCov=covSum/nF;
+  if(lastCov<FROST_MIN){var lo=0,hi=1;for(var it=0;it<22;it++){var mid=(lo+hi)/2,cs=0;for(i=0;i<HF;i++)if(covW[i]>0)cs+=covW[i]*mCov(thrA[i]-mid);if(cs/nF<FROST_MIN)lo=mid;else hi=mid;}thrShift=hi;}
+  o=0;draws.backFirst=0;
+  for(var pass=0;pass<2;pass++){
+    if(pass===1){
+      draws.backCount=o/FSTR;
+      o=emitCore(t,o);
+      draws.frontFirst=o/FSTR;
+    }
+    var cnt=pass===0?nb:nf,ord=pass===0?ordBack:ordFront;
+    for(k=0;k<cnt;k++){
+      i=ord[k];i3=i*3;a=hF[i3];b=hF[i3+1];c=hF[i3+2];
+      var nx=fN[i3],ny=fN[i3+1],nz=fN[i3+2];
+      // per-edge: bevel weight from the fold angle, +2 flags a silhouette edge (needs anti-aliasing)
+      var ew0,ew1,ew2;
+      for(j=0;j<3;j++){var g=hAdj[i3+j],fold=1-(nx*fN[g*3]+ny*fN[g*3+1]+nz*fN[g*3+2]);
+        var w=sstep(0.004,0.12,fold)+(fFront[g]!==fFront[i]?2:0)+(((fC[g*3]-fC[i3])*nx+(fC[g*3+1]-fC[i3+1])*ny+(fC[g*3+2]-fC[i3+2])*nz)>0.004?4:0);if(j===0)ew0=w;else if(j===1)ew1=w;else ew2=w;}
+      var fx=hFDir[i3],fy=hFDir[i3+1],fz=hFDir[i3+2],R=i*8;
+      var deep=sstep(dth,dth+0.16,fDeep[i]);
+      var frost=clamp(0.22+0.55*wav(wFrost,fx,fy,fz,t)/3,0,1);
+      var thr=thrA[i]-thrShift;
+      var tn=wav(wTone,fx,fy,fz,t)/3;
+      var sa=hFR[R+5]*W0*t+hFR[R+6];
+      // facet tangent frame (uv origin = centroid)
+      var A3=a*3,B3=b*3;x=hv[B3]-hv[A3];y=hv[B3+1]-hv[A3+1];z=hv[B3+2]-hv[A3+2];l=x*nx+y*ny+z*nz;x-=l*nx;y-=l*ny;z-=l*nz;l=1/Math.sqrt(x*x+y*y+z*z);x*=l;y*=l;z*=l;
+      o=emitTri(o,hv,a,b,c,nx,ny,nz,fC[i3],fC[i3+1],fC[i3+2],x,y,z,ny*z-nz*y,nz*x-nx*z,nx*y-ny*x,ew0,ew1,ew2,
+        0.022*hFR[R]+0.012*tn,0.17*hFR[R+1]+0.12*tn,deep,thr,
+        hFR[R+2]+0.07*Math.cos(sa),hFR[R+3]+0.07*Math.sin(sa),frost,1.75-0.6*deep,pass===0?dpH:thH,shH);
+    }
+  }
+  draws.frontCount=o/FSTR-draws.frontFirst;
+  // ---- lattice = steady frame (fixed node directions / radii, a ~1 % slow breath); the plates move inside it
+  var fbr=frameBreath(t);
+  for(i=0;i<HV;i++){
+    // FLEXIBLE JOINTS: every lattice node rides its hull corner, lifted 0.02 off the glass, so the rods follow each
+    // click and heartbeat and can never be swallowed by the body (rods = hull edges, lifted)
+    i3=i*3;x=hv[i3]-CX;y=hv[i3+1]-CY;z=hv[i3+2]-CZ;var rl=Math.sqrt(x*x+y*y+z*z),sl=(rl+0.02)/rl;
+    ln[i3]=CX+x*sl;ln[i3+1]=CY+y*sl;ln[i3+2]=CZ+z*sl;lHeat[i]=hHeat[i];ordJointKey[i]=ln[i3+2];
+  }
+  for(i=HV;i<NN;i++){
+    i3=i*3;var e=(i-HV)*2,p=hEd[e]*3,q=hEd[e+1]*3,s=0.5+0.06*Math.sin(nodeSK[i]*W0*t+nodeSP[i]);
+    ln[i3]=ln[p]+(ln[q]-ln[p])*s;ln[i3+1]=ln[p+1]+(ln[q+1]-ln[p+1])*s;ln[i3+2]=ln[p+2]+(ln[q+2]-ln[p+2])*s;
+    lHeat[i]=lHeat[hEd[e]]+(lHeat[hEd[e+1]]-lHeat[hEd[e]])*s;ordJointKey[i]=ln[i3+2];
+  }
+  sortIdx(ordJoint,NN,ordJointKey);
+  // ---- rods
+  var tau=t/LOOP,px=S.px;o=0;
+  for(i=0;i<NR;i++){
+    a=rodA[i]*3;b=rodB[i]*3;if(lHeat[rodB[i]]>lHeat[rodA[i]]){var sw_=a;a=b;b=sw_;}   // orient hot -> cold so current flows outward
+    var gx=rodK[i]*tau+rodPh[i];gx=(gx-Math.floor(gx))*22-0.5;     // glint slides along the rod, then rests off it
+    o=putRod(o,ln[a],ln[a+1],ln[a+2],ln[b],ln[b+1],ln[b+2],rodRad[i],0,gx,0.5*(lHeat[rodA[i]]+lHeat[rodB[i]]),1,0);
+  }
+  draws.latRods=NR;
+  // ---- outer cage: ghosts first (older = fainter, softer), then the live cage split far / near
+  cageNodes(t,MH,cg[0],true);
+  for(var gI=1;gI<=NGHOST;gI++){hullMatrix(t-gI*GHOST_DT,MG);cageNodes(t-gI*GHOST_DT,MG,cg[gI],false);}
+  var gAlpha=[0,0.22,0.13,0.07],gBlur=[0,0.9,1.9,3.0];
+  for(gI=NGHOST;gI>=1;gI--){var G=cg[gI];
+    for(i=0;i<CR;i++){a=cgA[i]*3;var bi=cgB[i];
+      if(bi>=0){b=bi*3;o=putRod(o,G[a],G[a+1],G[a+2],G[b],G[b+1],G[b+2],CG_ROD,(1.5+gBlur[gI])*px,-9,0,gAlpha[gI],1);}
+      else{b=(-1-bi)*3;o=putRod(o,G[a],G[a+1],G[a+2],ln[b],ln[b+1],ln[b+2],CG_STRUT,(1.3+gBlur[gI])*px,-9,0,gAlpha[gI]*0.8,2);}
+    }
+  }
+  draws.cgGhostRods=CR*NGHOST;
+  var G0=cg[0];
+  for(i=0;i<CR;i++){a=cgA[i]*3;bi=cgB[i];cgKey[i]=bi>=0?0.5*(G0[a+2]+G0[bi*3+2]):0.5*(G0[a+2]+ln[(-1-bi)*3+2]);}
+  sortIdx(cgOrd,CR,cgKey);
+  var nfar=0;
+  for(k=0;k<CR;k++){i=cgOrd[k];if(cgKey[i]<CZ)nfar++;a=cgA[i]*3;bi=cgB[i];
+    var gg=cgRK[i]*tau+cgRP[i];gg=(gg-Math.floor(gg))*14-0.5;
+    var nr=sstep(-0.5,0.7,cgKey[i]-CZ);if(bi>=0){b=bi*3;o=putRod(o,G0[a],G0[a+1],G0[a+2],G0[b],G0[b+1],G0[b+2],CG_ROD,(1.7+1.9*nr)*px,gg,0.5*(cgHeat[cgA[i]]+cgHeat[bi]),0.86-0.44*nr,1);}
+    else{b=(-1-bi)*3;o=putRod(o,G0[a],G0[a+1],G0[a+2],ln[b],ln[b+1],ln[b+2],CG_STRUT,(1.4+1.2*nr)*px,-9,cgHeat[cgA[i]],0.8-0.35*nr,2);}
+  }
+  draws.cgRodFar=nfar;draws.cgRodNear=CR-nfar;
+  // ---- joints
+  o=0;
+  for(k=0;k<NN;k++){i=ordJoint[k];i3=i*3;o=putJoint(o,ln[i3],ln[i3+1],ln[i3+2],nodeRad[i],0,lHeat[i],1,0,nodeLP[i]);}
+  draws.latJoints=NN;
+  for(gI=NGHOST;gI>=1;gI--){G=cg[gI];for(i=0;i<CN;i++){i3=i*3;o=putJoint(o,G[i3],G[i3+1],G[i3+2],CG_PEARL,(1.5+gBlur[gI])*px,0,gAlpha[gI],1,i);}}
+  draws.cgGhostJoints=CN*NGHOST;
+  for(i=0;i<CN;i++)cgJKey[i]=G0[i*3+2];
+  sortIdx(cgJOrd,CN,cgJKey);nfar=0;
+  for(k=0;k<CN;k++){i=cgJOrd[k];i3=i*3;if(G0[i3+2]<CZ)nfar++;var nj=sstep(-0.5,0.7,G0[i3+2]-CZ);o=putJoint(o,G0[i3],G0[i3+1],G0[i3+2],CG_PEARL,(1.7+1.6*nj)*px,cgHeat[i],0.92-0.34*nj,1,i);}
+  draws.cgJFar=nfar;draws.cgJNear=CN-nfar;
+}
+/* core: two distorted cuboids inside the hull; every quad is split along its convex diagonal, so facets
+   fold, flatten and flip without any pop (the two triangulations coincide exactly when the quad is planar) */
+function emitCore(t,o){
+  var c,i,j,k,q,x,y,z,l;
+  var tA=stepT(t,0.5),tB=stepT(t,0.0);   // the two blocks index alternately, like gears taking turns
+  // CONTACT: the turning block drags the resting one (friction), slams into its lock with a short overshoot + rattle,
+  // and the impact knocks the other block
+  var jA=jolt(lockAge(t,0.5)),jB=jolt(lockAge(t,0.0)),dA=drag(t,0.5),dB=drag(t,0.0);
+  m3ry(-14*W0*tA+0.4+0.11*jA-0.07*jB+0.10*dB,mT1);m3rx(0.35+0.25*Math.sin(4*W0*tA)+0.05*jB+0.06*dB,mT2);m3mul(mT1,mT2,mT3);m3mul(MH,mT3,MA);
+  m3rz(0.62+0.06*jA+0.07*dA,mT1);m3ry(18*W0*tB+1.9+0.11*jB-0.07*jA-0.10*dA,mT2);m3mul(mT1,mT2,mT3);m3rx(0.9+0.2*Math.sin(5*W0*tB+1.0),mT1);m3mul(mT3,mT1,mT2);m3mul(MH,mT2,MB);
+  var br=breath(t);
+  for(i=0;i<KV;i++){
+    c=i>>3;var ci=i&7,M=c?MB:MA,hx=kHalf[c],n6=i*6;var tc=c?tB:tA;
+    x=((ci&1)?1:-1)*hx[0]+0.03*Math.sin(kNK[n6]*W0*tc+kNP[n6])+0.02*Math.sin(kNK[n6+3]*W0*tc+kNP[n6+3]);
+    y=((ci&2)?1:-1)*hx[1]+0.03*Math.sin(kNK[n6+1]*W0*tc+kNP[n6+1])+0.02*Math.sin(kNK[n6+4]*W0*tc+kNP[n6+4]);
+    z=((ci&4)?1:-1)*hx[2]+0.03*Math.sin(kNK[n6+2]*W0*tc+kNP[n6+2])+0.02*Math.sin(kNK[n6+5]*W0*tc+kNP[n6+5]);
+    x*=br;y*=br;z*=br;
+    warp(M[0]*x+M[1]*y+M[2]*z+CX,M[3]*x+M[4]*y+M[5]*z+CY,M[6]*x+M[7]*y+M[8]*z+CZ,1.2,1.25);
+    var rx=WX-CX,ry=WY-CY,rz=WZ-CZ,r=Math.sqrt(rx*rx+ry*ry+rz*rz);rx/=r;ry/=r;rz/=r;
+    var lim=0.965*hullDist(rx,ry,rz),hh=Math.max(0.10-Math.abs(r-lim),0)/0.10,r2=Math.min(r,lim)-hh*hh*0.025;   // smooth min: corners stay inside the glass
+    kv[i*3]=CX+rx*r2;kv[i*3+1]=CY+ry*r2;kv[i*3+2]=CZ+rz*r2;
+  }
+  for(i=0;i<KV;i++){
+    x=kv[i*3];y=kv[i*3+1];z=kv[i*3+2];l=Math.sqrt(x*x+y*y+z*z);
+    rayHull(0,0,0,x/l,y/l,z/l,0.5);dpK[i]=RC?clamp(l-RN,0,3):0;
+    rayHull(x,y,z,LX,LY,LZ,0.005);shK[i]=RC?1-Math.exp(-1.1*RF):0;
+  }
+  var nt=0;
+  for(q=0;q<KQ;q++){
+    var a=kQ[q*4],b=kQ[q*4+1],cc=kQ[q*4+2],d=kQ[q*4+3],A=a*3,B=b*3,C=cc*3,Dd=d*3;
+    var ux=kv[B]-kv[A],uy=kv[B+1]-kv[A+1],uz=kv[B+2]-kv[A+2],vx=kv[C]-kv[A],vy=kv[C+1]-kv[A+1],vz=kv[C+2]-kv[A+2];
+    var nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+    var sd=nx*(kv[Dd]-kv[A])+ny*(kv[Dd+1]-kv[A+1])+nz*(kv[Dd+2]-kv[A+2]);
+    var T0,T1;   // triangles + which quad edge (0 ab,1 bc,2 cd,3 da, -1 diagonal) lies opposite each vertex
+    if(sd<=0){T0=[a,b,cc,1,-1,0];T1=[a,cc,d,2,3,-1];}else{T0=[a,b,d,-1,3,0];T1=[b,cc,d,2,-1,1];}
+    var sumx=0,sumy=0,sumz=0;
+    for(k=0;k<2;k++){var T=k?T1:T0,p0=T[0]*3,p1=T[1]*3,p2=T[2]*3;
+      ux=kv[p1]-kv[p0];uy=kv[p1+1]-kv[p0+1];uz=kv[p1+2]-kv[p0+2];vx=kv[p2]-kv[p0];vy=kv[p2+1]-kv[p0+1];vz=kv[p2+2]-kv[p0+2];
+      x=uy*vz-uz*vy;y=uz*vx-ux*vz;z=ux*vy-uy*vx;l=1/Math.sqrt(x*x+y*y+z*z);x*=l;y*=l;z*=l;
+      kTri[nt*3]=T[0];kTri[nt*3+1]=T[1];kTri[nt*3+2]=T[2];kTN[nt*3]=x;kTN[nt*3+1]=y;kTN[nt*3+2]=z;kTQ[nt]=q;
+      var cz=(kv[p0+2]+kv[p1+2]+kv[p2+2])/3,cx=(kv[p0]+kv[p1]+kv[p2])/3,cy=(kv[p0+1]+kv[p1+1]+kv[p2+1])/3;
+      kTFront[nt]=(x*cx+y*cy+z*cz)<0?1:0;
+      for(j=0;j<3;j++){kEdgeOf[nt*3+j]=T[3+j];if(T[3+j]>=0)kEF[q*4+T[3+j]]=kTFront[nt];}
+      sumx+=x;sumy+=y;sumz+=z;nt++;
+    }
+    // quad frame for the grain uv (follows the quad rigidly, continuous across the fold and across a flip)
+    l=1/Math.sqrt(sumx*sumx+sumy*sumy+sumz*sumz);sumx*=l;sumy*=l;sumz*=l;
+    x=kv[B]-kv[A];y=kv[B+1]-kv[A+1];z=kv[B+2]-kv[A+2];l=x*sumx+y*sumy+z*sumz;x-=l*sumx;y-=l*sumy;z-=l*sumz;l=1/Math.sqrt(x*x+y*y+z*z);x*=l;y*=l;z*=l;
+    var F=q*9;kFrame[F]=(kv[A]+kv[B]+kv[C]+kv[Dd])/4;kFrame[F+1]=(kv[A+1]+kv[B+1]+kv[C+1]+kv[Dd+1])/4;kFrame[F+2]=(kv[A+2]+kv[B+2]+kv[C+2]+kv[Dd+2])/4;
+    kFrame[F+3]=x;kFrame[F+4]=y;kFrame[F+5]=z;kFrame[F+6]=sumy*z-sumz*y;kFrame[F+7]=sumz*x-sumx*z;kFrame[F+8]=sumx*y-sumy*x;
+  }
+  draws.coreFirst=o/FSTR;
+  // fixed, pop-free draw order: back faces of A, of B, then front faces of A, of B
+  for(var pass=0;pass<2;pass++)for(c=0;c<2;c++)for(i=c*12;i<c*12+12;i++){
+    if(kTFront[i]!==pass)continue;
+    q=kTQ[i];var mate=(i&1)?i-1:i+1,R=q*8,Fq=q*9,w=[0,0,0];
+    var fold=1-(kTN[i*3]*kTN[mate*3]+kTN[i*3+1]*kTN[mate*3+1]+kTN[i*3+2]*kTN[mate*3+2]);
+    for(j=0;j<3;j++){var e=kEdgeOf[i*3+j];
+      if(e<0)w[j]=sstep(0.012,0.10,fold)+(kTFront[mate]!==kTFront[i]?2:0);
+      else{var nq=kQAdj[(q*4+e)*2],ne=kQAdj[(q*4+e)*2+1];w[j]=1+(kEF[nq*4+ne]!==kTFront[i]?2:0);}}
+    var fx=kFrame[Fq]-CX,fy=kFrame[Fq+1]-CY,fz=kFrame[Fq+2]-CZ;
+    var thr=0.46-0.11*wav(wCoreP,q*1.7,c*3.1,q*0.9,t)/3+0.05*kQR[R+4];
+    var sa=kQR[R+5]*W0*t+kQR[R+6];
+    o=emitTri(o,kv,kTri[i*3],kTri[i*3+1],kTri[i*3+2],kTN[i*3],kTN[i*3+1],kTN[i*3+2],kFrame[Fq],kFrame[Fq+1],kFrame[Fq+2],
+      kFrame[Fq+3],kFrame[Fq+4],kFrame[Fq+5],kFrame[Fq+6],kFrame[Fq+7],kFrame[Fq+8],w[0],w[1],w[2],
+      0.02*kQR[R]+(c?0.018:-0.012),0.10*kQR[R+1]+(c?-0.07:0.04),0.0,thr,
+      kQR[R+2]+0.09*Math.cos(sa),kQR[R+3]+0.09*Math.sin(sa),0.5,1.6,dpK,shK);
+  }
+  draws.coreCount=o/FSTR-draws.coreFirst;
+  return o;
+}
+
+/* ------------------------------------------------------------------ WebGL */
+var canvas=document.getElementById('c'),dbgEl=document.getElementById('dbg'),gl=null,hasDeriv=false,aniso=null;
+var P={},vboQuad,vboFacet,vboRod,vboJoint,iboQuads,texPal,texGrain,texAux,depthRB=null,TA=null,TB=null,Q0=null,Q1=null,Q2=null;
+var curAttr=0;
+function setAttr(n){var i;for(i=curAttr;i<n;i++)gl.enableVertexAttribArray(i);for(i=n;i<curAttr;i++)gl.disableVertexAttribArray(i);curAttr=n;}
+function sh(type,src){var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){var log=gl.getShaderInfoLog(s);console.error('shader compile failed: '+log+'\n'+src.split('\n').map(function(l,i){return (i+1)+': '+l;}).join('\n'));throw new Error('shader: '+log);}return s;}
+function prog(vs,fs,attrs,unis){
+  var p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+  for(var i=0;i<attrs.length;i++)gl.bindAttribLocation(p,i,attrs[i]);
+  gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS)){var log=gl.getProgramInfoLog(p);console.error('link failed: '+log);throw new Error('link: '+log);}
+  var o={p:p,n:attrs.length};for(i=0;i<unis.length;i++)o[unis[i]]=gl.getUniformLocation(p,unis[i]);return o;
+}
+var FSH;
+var VS_QUAD='attribute vec2 aP;varying vec2 vUv;void main(){vUv=aP*0.5+0.5;gl_Position=vec4(aP,0.0,1.0);}';
+
+/* BACKGROUND: flat pale sage, gentle gradient, soft backdrop light and a faint contact shadow */
+var FS_BG=`
+varying vec2 vUv;uniform vec3 uBg;uniform vec4 uObj;uniform float uAsp;
+uniform sampler2D uAux;uniform vec4 uCauD;uniform vec4 uBC;uniform vec4 uSh[8];uniform vec4 uShA[8];uniform vec3 uShC;uniform float uBGI;uniform vec4 uVx;
+float sdTri(vec2 p,float r){const float k=1.7320508;p.x=abs(p.x)-r;p.y=p.y+r/k;if(p.x+k*p.y>0.0)p=vec2(p.x-k*p.y,-k*p.x-p.y)/2.0;p.x-=clamp(p.x,-2.0*r,0.0);return -length(p)*sign(p.y);}
+void main(){
+  vec2 p=vUv;
+  vec2 d0=(p-uObj.xy)*vec2(uAsp,1.0)/uObj.z;
+  p+=vec2(sin(p.y*46.0+uVx.z*6.0),cos(p.x*38.0+uVx.z*5.0))*0.0022*exp(-dot(d0,d0)*0.12);   // heat shimmer
+  vec3 c=uBg;
+  c+=(p.x-0.5)*0.040+(p.y-0.5)*0.030;
+  vec2 d=(p-uObj.xy)*vec2(uAsp,1.0)/uObj.z;
+  c+=0.020*exp(-dot(d,d)*0.30);
+  // HEAT + PRESSURE: the forge the crystal grows in. Compression rings close in on it (irregular, like strata being
+  // squeezed), caustic filaments ride the rings inward, and a deep heat glow sits behind it, swelling on each heartbeat
+  float r=length(d)+1e-3,an=atan(d.y,d.x);
+  float wob=0.22*sin(3.0*an+uVx.y)+0.12*sin(5.0*an-uVx.y*0.7);
+  float ring=pow(0.5+0.5*sin(3.3*(r+wob)+uVx.w),6.0);
+  float c1=texture2D(uAux,vec2(an*0.477+uCauD.x,r*0.30+uVx.w*0.050)).a,c2=texture2D(uAux,vec2(-an*0.318+0.37+uCauD.z,r*0.41+uVx.w*0.068)).a;
+  float ca=min(c1,c2)*2.4+(c1+c2)*0.08;
+  float env=smoothstep(1.0,1.6,r)*exp(-pow(max(r-3.0,0.0),2.0)*0.8);
+  vec3 heat=mix(uBC.rgb,vec3(1.0,0.62,0.30),0.45);
+  c+=heat*(ring*0.12+ca*0.26*(0.4+0.6*ring))*env*uBGI*(1.0+0.5*uBC.w);
+  c+=heat*exp(-r*r*0.30)*(0.12+0.14*uBC.w)*uBGI;
+  // drifting out-of-focus crystal shards, deep behind (soft triangles, faint facet light)
+  for(int i=0;i<8;i++){
+    vec4 sh=uSh[i];vec4 sa=uShA[i];
+    vec2 r=(p-sh.xy)*vec2(uAsp,1.0);float cs=cos(sh.w),sn=sin(sh.w);r=vec2(cs*r.x-sn*r.y,sn*r.x+cs*r.y);r.y*=0.62;
+    float dd=sdTri(r,sh.z);float a=1.0-smoothstep(-sa.y,sa.y,dd);
+    float face=0.5+0.5*dot(normalize(r+1e-4),vec2(-0.6,0.8));
+    c=mix(c,uShC*(0.86+0.30*face*sa.z),min(a*sa.x*uBGI,1.0));c+=uBC.rgb*0.10*a*sa.x*smoothstep(-0.004,0.0,dd)*(1.0-smoothstep(0.0,0.004+sa.y,dd));
+  }
+  vec2 s=(p-vec2(uObj.x,uObj.y-uObj.z*uObj.w))*vec2(uAsp,1.0)/uObj.z;
+  c*=1.0-0.05*exp(-(s.x*s.x*0.6+s.y*s.y*3.0));
+  // twilight: dusk falls toward the edges, a cooler sky up top
+  c*=1.0-0.16*smoothstep(0.30,1.0,length((vUv-0.5)*vec2(1.0,0.75))*1.45);
+  c*=mix(vec3(1.0),vec3(0.93,0.95,1.04),smoothstep(0.4,1.0,vUv.y));
+  gl_FragColor=vec4(c,0.0);
+}`;
+
+/* FACETS (glass body, flat shaded): palette LUT, grain islands with bump + sparkles, bevel edge light,
+   silhouette anti-aliasing; BACK variant = far hull faces + core (with caustics), FRONT variant = near panes
+   that refract the already-rendered interior. */
+var VS_FACET=`
+attribute vec3 aPos;attribute vec4 aA,aB,aC,aD,aE,aF,aG;
+uniform mat4 uProj;
+varying vec4 vA,vB,vC,vD,vE,vF,vG;
+invariant gl_Position;
+void main(){
+  gl_Position=uProj*vec4(aPos,1.0);
+  vA=aA;vB=vec4(aB.xyz*gl_Position.w,aB.w);vC=aC;vD=aD;vE=aE;vF=aF;vG=aG;
+}`;
+var VS_DEPTH=`
+attribute vec3 aPos;uniform mat4 uProj;invariant gl_Position;
+void main(){gl_Position=uProj*vec4(aPos,1.0);}`;
+var FS_DEPTH='void main(){gl_FragColor=vec4(0.0);}';
+var FS_FACET=`
+varying vec4 vA,vB,vC,vD,vE,vF,vG;
+uniform sampler2D uPal,uGrain,uAux;
+uniform vec4 uPhase;   // palette phase | grain lod bias | mask softness fallback | scene px per css px
+uniform vec4 uCau;     // caustic drift
+uniform vec4 uK;       // BACK: opacity, caustic gain, tone base, edge gain   FRONT: refraction px, sparkle gain, tone base, edge gain
+uniform vec3 uL;
+uniform vec3 uTouch[5];
+uniform vec3 uWake[16];
+uniform vec4 uBeat;    // heartbeat level | ring radius | ring strength | -
+uniform vec2 uCen;     // body centre (px)
+uniform vec4 uTouchP;  // any touch | ripple phase | px per world unit | depth shade on
+uniform vec2 uRes;
+#ifdef FRONT
+uniform sampler2D uBehind,uBlur;
+#endif
+vec3 pal(float ph,float tone){return texture2D(uPal,vec2(ph,clamp(tone,0.0,1.0)*0.96875+0.015625)).rgb;}
+float heatAt(vec2 fc){
+  float h=0.0;
+  for(int i=0;i<5;i++){
+    vec3 t=uTouch[i];
+    if(t.z>0.002){
+      float d=length(fc-t.xy)/uTouchP.z;
+      float ring=0.5+0.5*sin(6.2831853*(d*2.1-uTouchP.y-float(i)*0.21));
+      h+=t.z*(exp(-d*d*3.2)*0.9+ring*exp(-d*1.6)*0.35);
+    }
+  }
+  for(int j=0;j<16;j++){
+    vec3 w=uWake[j];
+    if(w.z>0.003){float d=length(fc-w.xy)/uTouchP.z;h+=w.z*exp(-d*d*11.0)*0.75;}
+  }
+  return min(h,1.4);
+}
+void main(){
+  vec2 uv=vA.xy;
+  vec3 ed=vB.xyz*gl_FragCoord.w;                 // screen-space distance (px) to each triangle edge
+  vec3 ccv=step(3.5,vC.xyz);vec3 e2v=vC.xyz-4.0*ccv;      // +4 = concave crease, +2 = silhouette edge, rest = fold weight
+  vec3 aaF=step(1.5,e2v);vec3 wt=e2v-2.0*aaF;
+  float dsh=uTouchP.w;
+  float thk=vG.w;                                         // FRONT: glass thickness behind this point; BACK: glass in front of it
+  float hb=uBeat.x;
+  float rdc=length(gl_FragCoord.xy-uCen)/uTouchP.z-uBeat.y;
+  float bt=0.085*hb+0.11*uBeat.z*exp(-rdc*rdc*36.0);                 // heartbeat: whole-body flush + a ring travelling outward
+  float absb=(1.0-exp(-1.45*thk*thk))*dsh*(1.0-0.34*hb);                    // Beer-Lambert style absorption
+  float shd=vF.w*dsh;                                     // light path through the body = soft cast shadow
+  vec3 aov=exp(-ed/(18.0*uPhase.w))*ccv*wt;
+  float ao=max(aov.x,max(aov.y,aov.z))*dsh;               // crease occlusion where plates fold toward each other
+  vec3 wl=wt*(1.0-ccv);
+  vec2 Nxy=vec2(vB.w,vC.w);
+  float deep=vD.z;vec2 seed=vE.xy;
+  vec3 Lt=vF.xyz;vec3 Ht=normalize(vG.xyz);
+  float px=uPhase.w;
+  float wrap=Lt.z*0.5+0.5;
+  float fres=pow(1.0-clamp(abs(vA.w),0.0,1.0),3.0);
+  float topg=smoothstep(-0.45,1.05,vA.z);
+  float heat=0.0;if(uTouchP.x>0.5)heat=heatAt(gl_FragCoord.xy);
+  float ph=uPhase.x+vD.x+heat*0.055;
+  // grain islands: thresholded low-frequency field (continent outlines + satellites), clipped by the facet
+  vec2 muv=uv*0.33+seed;
+  float m=texture2D(uGrain,muv).a*0.66+texture2D(uGrain,muv*2.9+seed.yx*3.1).a*0.34;
+#ifdef DERIV
+  float sm=clamp(fwidth(m)*0.9,0.004,0.09);
+  vec2 gm=vec2(dFdx(m),dFdy(m));
+#else
+  float sm=uPhase.z;vec2 gm=vec2(0.0);
+#endif
+  float thH=vD.w-heat*0.32;                      // touch: frost crystals grow outward from the finger
+  float pm=smoothstep(thH-sm,thH+sm,m);
+  vec4 g=texture2D(uGrain,uv*vE.w+seed*7.0,uPhase.y);
+  vec3 gn=normalize(vec3(-(g.gb*2.0-1.0)*4.6,1.0));
+  float emb=dot(gn,Lt)-Lt.z;emb=max(emb,-0.30)+0.02;
+  vec4 ax=texture2D(uAux,uv*0.47+seed*3.0);
+  vec3 sn=normalize(vec3((ax.rg*2.0-1.0)*0.95,1.0));
+  float spark=pow(max(dot(sn,Ht),0.0),60.0)*smoothstep(0.22,0.48,ax.b)*pm;
+  float gl2=dot(gm,gm);
+  float rim=gl2>1e-12?-dot(gm*inversesqrt(gl2),uL.xy)*pm*(1.0-pm)*4.0:0.0;
+#ifdef FRONT
+  float tone=uK.z+0.20*dsh+0.42*pow(wrap,1.3)+0.17*topg-0.50*deep+vD.y+heat*0.30-0.66*absb-0.26*shd-0.52*ao+bt;
+  deep=clamp(deep*(1.0-0.5*dsh)+absb*1.05,0.0,1.0);
+  float fr=clamp(vE.z+topg*0.40,0.0,1.0);
+  vec2 suv=gl_FragCoord.xy/uRes;
+  vec2 ruv=clamp(suv-Nxy*uK.x*(0.55+0.55*thk*dsh+0.45*(1.0-dsh))/uRes,vec2(0.002),vec2(0.998));
+  vec4 s0=texture2D(uBehind,suv);
+  vec4 s1=texture2D(uBehind,ruv);
+  vec3 bh=mix(s0.rgb,s1.rgb,s1.a);
+  bh=mix(bh,texture2D(uBlur,ruv).rgb,(0.30+0.45*fr*fr)*s1.a);   // depth of field: what lies behind the front glass is out of focus
+  vec3 tint=pal(ph,0.46-0.44*deep);
+  bh*=mix(vec3(1.0),tint*1.12,0.06+0.80*deep)*(1.0-0.30*ao-0.14*shd);
+  float op=mix(0.40,0.74,fr)+fres*0.24+0.24*(1.0-absb)*dsh;op=mix(op,0.32,deep);
+  vec3 col=mix(bh,pal(ph+fres*0.03,tone),clamp(op,0.0,1.0));
+  float pt=tone+0.20+emb*(1.45-0.5*deep)+(g.r-0.5)*0.45+rim*0.25;
+  col=mix(col,pal(ph+0.008,pt),pm*0.92);
+  col+=spark*uK.y*(1.0+2.2*heat)*vec3(1.0,0.97,1.0);
+  float spec=pow(max(Ht.z,0.0),56.0);
+  col+=spec*0.20*(1.0-pm*0.8);
+  col+=fres*(0.16+0.34*hb)*pal(ph,1.0)*(1.0-pm);
+  vec3 lnv=(1.0-smoothstep(vec3(0.0),vec3(1.5*px),ed))*wl;
+  col=mix(col,pal(ph,0.98),max(lnv.x,max(lnv.y,lnv.z))*uK.w);
+  vec3 f=mix(vec3(1.0),smoothstep(vec3(0.0),vec3(1.3),ed),aaF);
+  gl_FragColor=vec4(col,f.x*f.y*f.z);
+#else
+  float tone=uK.z+0.14*dsh+0.46*pow(wrap,1.3)+0.16*topg-0.45*deep+vD.y+heat*0.25-0.52*absb-0.32*shd-0.54*ao+bt;
+  vec3 col=pal(ph,tone);
+  float c1=texture2D(uAux,uv*0.61+uCau.xy+seed).a;
+  float c2=texture2D(uAux,uv*0.47-uCau.zw+seed.yx).a;
+  col+=pal(ph,1.0)*min(c1,c2)*uK.y*(1.15-topg);
+  float pt=tone+0.20+emb*1.6+(g.r-0.5)*0.5+rim*0.22;
+  col=mix(col,pal(ph+0.008,pt),pm*0.86);
+  col+=spark*1.2;
+  vec3 lnv=(1.0-smoothstep(vec3(0.0),vec3(2.0*px),ed))*wl;
+  col=mix(col,pal(ph,0.95),max(lnv.x,max(lnv.y,lnv.z))*uK.w);
+  vec3 f=mix(vec3(1.0),smoothstep(vec3(0.0),vec3(1.4),ed),aaF);
+  gl_FragColor=vec4(col,uK.x*f.x*f.y*f.z);
+#endif
+}`;
+
+/* RODS: screen-space expanded quads, analytic anti-aliasing + depth-of-field blur, cylinder sheen, travelling glint */
+var VS_ROD=`
+attribute vec3 aP0,aP1;attribute vec4 aS,aM;
+uniform mat4 uProj;uniform vec4 uCam;uniform vec2 uRes;
+varying vec4 vR,vM;varying vec2 vNrm;
+void main(){
+  vec4 c0=uProj*vec4(aP0*(1.0-uCam.w),1.0),c1=uProj*vec4(aP1*(1.0-uCam.w),1.0);
+  vec2 s0=c0.xy/c0.w*uRes*0.5,s1=c1.xy/c1.w*uRes*0.5;
+  vec2 dir=s1-s0;float len=max(length(dir),1e-4);dir/=len;
+  vec2 nrm=vec2(-dir.y,dir.x);
+  float e=aS.y;vec4 c=mix(c0,c1,e);
+  float z=max(-mix(aP0.z,aP1.z,e),0.1);
+  float rpx=aS.z*uCam.x/z;
+  float b=max(uCam.z*abs(z-uCam.y)/z+aS.w,0.72);
+  float hw=rpx+b+0.5+(aM.w<0.5?clamp(aM.y*1.6,0.0,1.0)*13.0:0.0);   // room for the arc beside a charged rod
+  gl_Position=vec4(c.xy+nrm*aS.x*hw*2.0/uRes*c.w,c.z,c.w);
+  vR=vec4(aS.x*hw*c.w,rpx*c.w,b*c.w,e);vM=aM;vNrm=nrm;
+}`;
+var FS_ROD=`
+varying vec4 vR,vM;varying vec2 vNrm;
+uniform vec3 uCol,uShade,uHot,uL;uniform float uBt,uTime;
+void main(){
+  vec3 q=vR.xyz*gl_FragCoord.w;
+  float d=abs(q.x),r=q.y,b=q.z;
+  float cov=clamp((r+b-d)/(2.0*b),0.0,1.0);cov=cov*cov*(3.0-2.0*cov);
+  float x=clamp(q.x/max(r,0.4),-1.0,1.0);
+  vec3 n=vec3(vNrm*x,sqrt(max(1.0-x*x,0.0)));
+  float soft=clamp(b/(r+0.6)-0.6,0.0,1.0);
+  float dif=mix(dot(n,uL)*0.5+0.5,0.74,soft*0.75);
+  vec3 col=mix(uShade,uCol,smoothstep(0.18,0.86,dif));
+  if(vM.w<0.5)col=mix(vec3(0.15,0.14,0.18),vec3(0.60,0.59,0.66),smoothstep(0.20,0.95,dif));   // lattice: dark gunmetal wire (cage stays pale)
+  col+=pow(max(dot(n,normalize(uL+vec3(0.0,0.0,1.0))),0.0),22.0)*0.22*(1.0-soft);
+  float gz=(vR.w-vM.x)/0.15;float gli=exp(-gz*gz)*(1.0+0.8*uBt);
+  if(vM.w<0.5)col=mix(col,vec3(1.0),0.15*uBt);
+  col=mix(col,vec3(1.0),gli*0.8);
+  col=mix(col,uHot,clamp(vM.y,0.0,1.0)*0.45);
+  if(vM.w>1.5)col=mix(col,uShade,0.25*(1.0-vR.w));      // struts fade a little toward the body
+  float aR=min(cov*vM.z*(1.0+gli*0.5),1.0);
+  if(vM.w<0.5&&vM.y>0.03){
+    // ELECTRICITY: current flows from the finger outward (rod runs hot end -> cold end), a jagged white-hot bolt with a
+    // blue glow that re-zigzags ~22x a second, travelling packets, fading with distance from the touch
+    float H=clamp(vM.y*1.6,0.0,1.0),T=floor(uTime*22.0);
+    float u=vR.w*9.0+T*1.7,fu=floor(u);
+    float n1=fract(sin(fu*12.9898+T*4.1)*43758.5453),n2=fract(sin((fu+1.0)*12.9898+T*4.1)*43758.5453);
+    float bx=(mix(n1,n2,fract(u))*2.0-1.0)*(r+8.0*H);
+    float dl=abs(q.x-bx);
+    float flow=0.5+0.5*sin(6.2831853*(vR.w*1.6-uTime*4.5));
+    float env=H*mix(1.0,0.35,vR.w)*(0.30+0.70*flow)*(0.70+0.30*fract(sin(T*3.3)*999.0));
+    float core=exp(-dl*dl/1.1)*env*1.5,glow=exp(-dl*dl/28.0)*env*0.85;
+    vec3 ec=mix(vec3(0.42,0.66,1.0),vec3(1.0),clamp(core*1.2,0.0,1.0));
+    float eA=clamp(core*1.7+glow,0.0,1.0),A=max(aR,eA);
+    col=mix(col,ec,eA/max(A,1e-4));aR=A;
+  }
+  gl_FragColor=vec4(col,aR);
+}`;
+
+/* JOINTS: billboard spheres, pearl shading, same analytic AA / blur */
+var VS_JOINT=`
+attribute vec3 aC;attribute vec4 aS,aM;
+uniform mat4 uProj;uniform vec4 uCam;uniform vec2 uRes;uniform float uBt;
+varying vec4 vQ,vM;
+void main(){
+  vec4 c=uProj*vec4(aC*(1.0-uCam.w),1.0);
+  float z=max(-aC.z,0.1);
+  float rpx=aS.z*uCam.x/z*(1.0+0.16*uBt*(1.0-step(0.5,aM.z)));
+  float b=max(uCam.z*abs(z-uCam.y)/z+aS.w,0.72);
+  float ext=rpx+b+0.5;
+  gl_Position=vec4(c.xy+aS.xy*ext*2.0/uRes*c.w,c.z,c.w);
+  vQ=vec4(aS.xy*ext,rpx,b);vM=aM;
+}`;
+var FS_JOINT=`
+varying vec4 vQ,vM;
+uniform vec3 uCol,uShade,uHot,uL,uSheen;uniform float uBt,uTime;
+void main(){
+  float d=length(vQ.xy),r=vQ.z,b=vQ.w;
+  float cov=clamp((r+b-d)/(2.0*b),0.0,1.0);cov=cov*cov*(3.0-2.0*cov);
+  vec2 nxy=vQ.xy/max(r,0.6);float l2=dot(nxy,nxy);
+  if(l2>1.0){nxy*=inversesqrt(l2);l2=1.0;}
+  vec3 n=vec3(nxy,sqrt(1.0-l2));
+  float soft=clamp(b/(r+0.6)-0.35,0.0,1.0);
+  float dif=dot(n,uL)*0.5+0.5;
+  vec3 col=mix(uShade,uCol,smoothstep(0.22,0.90,dif));
+  if(vM.z<0.5)col=mix(vec3(0.13,0.12,0.16),vec3(0.72,0.71,0.77),smoothstep(0.15,0.95,dif));   // lattice beads: polished gunmetal
+  col=mix(col,uSheen,(1.0-n.z)*(1.0-n.z)*0.35);                 // pearlescent rim in the body hue
+  vec3 hv=normalize(uL+vec3(0.0,0.0,1.0));
+  float sp=pow(max(dot(n,hv),0.0),26.0);
+  col+=sp*(0.55+0.5*uBt)*(1.0-soft);
+  if(vM.z<0.5)col=mix(col,vec3(1.0),0.28*uBt);
+  col=mix(col,mix(uShade,uCol,0.70),soft*0.8);
+  col=mix(col,uHot,clamp(vM.x,0.0,1.0)*0.45);
+  if(vM.z<0.5&&vM.x>0.03){float fl=0.55+0.45*fract(sin(vM.w*91.7+floor(uTime*22.0)*7.31)*43758.5453);col=mix(col,vec3(0.90,0.95,1.0),clamp(vM.x,0.0,1.0)*fl);}   // charged nodes glow hot and flicker
+  gl_FragColor=vec4(col,cov*vM.y);
+}`;
+var VS_GLOW='attribute vec2 aP;uniform vec4 uC;varying vec2 vUv;void main(){vUv=aP;gl_Position=vec4(uC.xy+aP*uC.zw,0.0,1.0);}';
+var FS_GLOW='varying vec2 vUv;uniform vec4 uCol;void main(){float d=dot(vUv,vUv);float a=max(exp(-d*3.2)-0.0408,0.0);gl_FragColor=vec4(uCol.rgb,a*uCol.a);}';
+var FS_COPY='varying vec2 vUv;uniform sampler2D uTex;void main(){gl_FragColor=texture2D(uTex,vUv);}';
+var FS_DOWN=`
+varying vec2 vUv;uniform sampler2D uTex;uniform vec2 uTexel;uniform vec3 uThr;
+void main(){
+  vec4 c=texture2D(uTex,vUv+uTexel*vec2(-1.0,-1.0))+texture2D(uTex,vUv+uTexel*vec2(1.0,-1.0))+texture2D(uTex,vUv+uTexel*vec2(-1.0,1.0))+texture2D(uTex,vUv+uTexel*vec2(1.0,1.0));
+  c*=0.25;
+  if(uThr.z>0.5){float l=max(c.r,max(c.g,c.b));float k=clamp((l-uThr.x)/uThr.y,0.0,1.0);c.rgb*=k*k;}
+  gl_FragColor=c;
+}`;
+var FS_BLUR=`
+varying vec2 vUv;uniform sampler2D uTex;uniform vec2 uDir;
+void main(){
+  vec4 c=texture2D(uTex,vUv)*0.2270270;
+  c+=(texture2D(uTex,vUv+uDir*1.3846154)+texture2D(uTex,vUv-uDir*1.3846154))*0.3162162;
+  c+=(texture2D(uTex,vUv+uDir*3.2307692)+texture2D(uTex,vUv-uDir*3.2307692))*0.0702703;
+  gl_FragColor=c;
+}`;
+/* FINAL: bloom (screen blend), very soft vignette, static dither against banding */
+var FS_FINAL=`
+varying vec2 vUv;uniform sampler2D uScene,uBloom;uniform vec4 uFx;
+void main(){
+  vec3 c=texture2D(uScene,vUv).rgb;
+  vec3 bl=texture2D(uBloom,vUv).rgb;
+  c=1.0-(1.0-c)*(1.0-clamp(bl*uFx.x,0.0,1.0));
+  vec2 q=(vUv-0.5)*vec2(min(uFx.w,1.0),min(1.0/uFx.w,1.0))*2.0;
+  c*=1.0-uFx.y*smoothstep(0.55,1.45,length(q));
+  float n=fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+  c+=(n-0.5)*uFx.z;
+  gl_FragColor=vec4(c,1.0);
+}`;
+/* procedural textures, rendered once on the GPU at start-up (no image assets) */
+var FS_GRAIN=`
+varying vec2 vUv;
+vec2 h2(vec2 p,float per){p=mod(p,per);vec3 q=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));q+=dot(q,q.yzx+33.33);return fract((q.xx+q.yz)*q.zy)*2.0-1.0;}
+float gn(vec2 p,float per){vec2 i=floor(p),f=fract(p);vec2 u=f*f*f*(f*(f*6.0-15.0)+10.0);
+  float a=dot(h2(i,per),f),b=dot(h2(i+vec2(1.0,0.0),per),f-vec2(1.0,0.0)),c=dot(h2(i+vec2(0.0,1.0),per),f-vec2(0.0,1.0)),d=dot(h2(i+vec2(1.0,1.0),per),f-vec2(1.0,1.0));
+  return mix(mix(a,b,u.x),mix(c,d,u.x),u.y);}
+/* frost = fine sugar grains: one jittered round bead per cell (tileable), random size, plus a faint fine noise */
+float beads(vec2 uv,float per,float seed){
+  vec2 p=uv*per,i=floor(p),f=fract(p);float h=0.0;
+  for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
+    vec2 o=vec2(float(x),float(y)),c=i+o;
+    vec2 j=h2(c+seed,per)*0.5+0.5,k=h2(c+seed+17.0,per)*0.5+0.5;
+    float r=0.22+0.30*k.x,d=length(o+j*0.8+0.1-f)/r;
+    h=max(h,sqrt(max(1.0-d*d,0.0))*(0.55+0.45*k.y));
+  }
+  return h;
+}
+float height(vec2 uv){
+  float b1=beads(uv,96.0,0.0),b2=beads(uv,160.0,31.0);
+  float n=gn(uv*192.0,192.0);
+  return 0.62*b1+0.30*b2+0.10*n;
+}
+float fbm(vec2 uv){float s=0.0,a=0.5,per=4.0;vec2 p=uv*4.0;
+  for(int i=0;i<5;i++){s+=a*gn(p+vec2(17.3,5.9)*float(i+1),per);p*=2.0;per*=2.0;a*=0.5;}return s;}
+void main(){
+  float e=1.0/512.0;
+  float h=height(vUv);
+  float dx=height(vUv+vec2(e,0.0))-height(vUv-vec2(e,0.0));
+  float dy=height(vUv+vec2(0.0,e))-height(vUv-vec2(0.0,e));
+  gl_FragColor=vec4(clamp(h*0.62+0.38,0.0,1.0),clamp(dx*3.2,-1.0,1.0)*0.5+0.5,clamp(dy*3.2,-1.0,1.0)*0.5+0.5,clamp(0.5+fbm(vUv)*0.95,0.0,1.0));
+}`;
+var FS_AUX=`
+varying vec2 vUv;
+float h1(vec2 p){vec3 q=fract(vec3(p.xyx)*.1031);q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}
+float caus(vec2 uv){
+  vec2 p=mod(uv*6.28318530718,6.28318530718)-250.0;vec2 i=p;float c=1.0;
+  for(int n=0;n<5;n++){float t=24.6*(1.0-(3.5/float(n+1)));
+    i=p+vec2(cos(t-i.x)+sin(t+i.y),sin(t-i.y)+cos(t+i.x));
+    c+=1.0/length(vec2(p.x/(sin(i.x+t)/0.005),p.y/(cos(i.y+t)/0.005)));}
+  c/=5.0;c=1.17-pow(c,1.4);return pow(abs(c),8.0);
+}
+void main(){vec2 cell=floor(vUv*256.0);
+  gl_FragColor=vec4(h1(cell+1.5),h1(cell+71.3),h1(cell+133.7),clamp(caus(vUv),0.0,1.0));}`;
+
+function mkTex(w,h,filter,wrap,data){
+  var t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,data||null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,wrap);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,wrap);
+  return t;
+}
+function mkTarget(w,h,depth){
+  var t=mkTex(w,h,gl.LINEAR,gl.CLAMP_TO_EDGE,null),f=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  if(depth)gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)console.error('framebuffer incomplete '+w+'x'+h);
+  return {t:t,f:f,w:w,h:h};
+}
+function freeTarget(T){if(T){gl.deleteTexture(T.t);gl.deleteFramebuffer(T.f);}}
+function drawQuad(){gl.bindBuffer(gl.ARRAY_BUFFER,vboQuad);setAttr(1);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);}
+
+function initGL(){
+  gl=canvas.getContext('webgl',{alpha:false,antialias:false,depth:false,stencil:false,premultipliedAlpha:false,preserveDrawingBuffer:false,powerPreference:'high-performance'})||
+     canvas.getContext('experimental-webgl',{alpha:false,antialias:false,depth:false,stencil:false});
+  if(!gl)return false;
+  curAttr=0;
+  hasDeriv=!!gl.getExtension('OES_standard_derivatives');
+  aniso=gl.getExtension('EXT_texture_filter_anisotropic')||gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
+  FSH=(hasDeriv?'#extension GL_OES_standard_derivatives : enable\n#define DERIV 1\n':'')+'#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n';
+  var FA=['aPos','aA','aB','aC','aD','aE','aF','aG'],FU=['uProj','uPal','uGrain','uAux','uPhase','uCau','uK','uL','uTouch[0]','uWake[0]','uTouchP','uRes','uBehind','uBlur','uBeat','uCen'];
+  P.bg=prog(VS_QUAD,FSH+FS_BG,['aP'],['uBg','uObj','uAsp','uAux','uCauD','uBC','uSh[0]','uShA[0]','uShC','uBGI','uVx']);
+  P.depth=prog(VS_DEPTH,FSH+FS_DEPTH,['aPos'],['uProj']);
+  P.back=prog(VS_FACET,FSH+FS_FACET,FA,FU);
+  P.front=prog(VS_FACET,FSH+'#define FRONT 1\n'+FS_FACET,FA,FU);
+  P.rod=prog(VS_ROD,FSH+FS_ROD,['aP0','aP1','aS','aM'],['uProj','uCam','uRes','uCol','uShade','uHot','uL','uBt','uTime']);
+  P.joint=prog(VS_JOINT,FSH+FS_JOINT,['aC','aS','aM'],['uProj','uCam','uRes','uCol','uShade','uHot','uL','uSheen','uBt','uTime']);
+  P.glow=prog(VS_GLOW,FSH+FS_GLOW,['aP'],['uC','uCol']);
+  P.copy=prog(VS_QUAD,FSH+FS_COPY,['aP'],['uTex']);
+  P.down=prog(VS_QUAD,FSH+FS_DOWN,['aP'],['uTex','uTexel','uThr']);
+  P.blur=prog(VS_QUAD,FSH+FS_BLUR,['aP'],['uTex','uDir']);
+  P.fin=prog(VS_QUAD,FSH+FS_FINAL,['aP'],['uScene','uBloom','uFx']);
+  vboQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vboQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  vboFacet=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vboFacet);gl.bufferData(gl.ARRAY_BUFFER,facetData,gl.DYNAMIC_DRAW);
+  vboRod=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vboRod);gl.bufferData(gl.ARRAY_BUFFER,rodData,gl.DYNAMIC_DRAW);
+  vboJoint=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vboJoint);gl.bufferData(gl.ARRAY_BUFFER,jointData,gl.DYNAMIC_DRAW);
+  var nq=NR+CR*(NGHOST+1),idx=new Uint16Array(nq*6);
+  for(var i=0;i<nq;i++){idx[i*6]=i*4;idx[i*6+1]=i*4+1;idx[i*6+2]=i*4+2;idx[i*6+3]=i*4+2;idx[i*6+4]=i*4+1;idx[i*6+5]=i*4+3;}
+  iboQuads=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,iboQuads);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,idx,gl.STATIC_DRAW);
+  // palette LUT: x = phase (wraps), y = tone
+  var LW=128,LH=32,lut=new Uint8Array(LW*LH*4),c=[0,0,0];
+  for(var y=0;y<LH;y++)for(var x=0;x<LW;x++){palAt((x+0.5)/LW,y/(LH-1),c);var o=(y*LW+x)*4;lut[o]=Math.round(c[0]*255);lut[o+1]=Math.round(c[1]*255);lut[o+2]=Math.round(c[2]*255);lut[o+3]=255;}
+  texPal=mkTex(LW,LH,gl.LINEAR,gl.CLAMP_TO_EDGE,lut);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  // grain + aux textures rendered by shaders
+  gl.disable(gl.BLEND);gl.disable(gl.DEPTH_TEST);
+  var pg=prog(VS_QUAD,FSH+FS_GRAIN,['aP'],[]),pa=prog(VS_QUAD,FSH+FS_AUX,['aP'],[]);
+  var G=mkTarget(512,512,null);gl.viewport(0,0,512,512);gl.useProgram(pg.p);drawQuad();texGrain=G.t;
+  // measure the frost-mask distribution once: m = 0.66*A(u) + 0.34*A(u*2.9 + s), the same mix the facet shader uses
+  try{var px=new Uint8Array(512*512*4);gl.readPixels(0,0,512,512,gl.RGBA,gl.UNSIGNED_BYTE,px);
+    var mr=mulberry32(7),N=24000,arr=new Float32Array(N);
+    function A_(u,v){u-=Math.floor(u);v-=Math.floor(v);return px[((Math.floor(v*512)%512)*512+(Math.floor(u*512)%512))*4+3]/255;}
+    for(var si=0;si<N;si++){var u=mr(),v=mr(),sx=mr()*8,sy=mr()*8;arr[si]=A_(u,v)*0.66+A_(u*2.9+sy*3.1,v*2.9+sx*3.1)*0.34;}
+    arr.sort();mSorted=arr;}catch(err){mSorted=null;}
+  gl.deleteFramebuffer(G.f);
+  gl.bindTexture(gl.TEXTURE_2D,texGrain);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+  gl.generateMipmap(gl.TEXTURE_2D);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+  if(aniso)gl.texParameterf(gl.TEXTURE_2D,aniso.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(4,gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  var A=mkTarget(256,256,null);gl.viewport(0,0,256,256);gl.useProgram(pa.p);drawQuad();texAux=A.t;gl.deleteFramebuffer(A.f);
+  gl.bindTexture(gl.TEXTURE_2D,texAux);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+  gl.deleteProgram(pg.p);gl.deleteProgram(pa.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  TA=TB=Q0=Q1=Q2=null;depthRB=null;
+  return true;
+}
+
+/* ------------------------------------------------------------------ sizing + quality tiers */
+var TIERS=[{s:1.0,ghost:3,bloom:1,name:'high'},{s:0.8334,ghost:2,bloom:1,name:'med'},{s:0.6667,ghost:1,bloom:0,name:'low'}];
+var tier=0,tierLocked=false;
+if(OPT.q==='high'){tier=0;tierLocked=true;}else if(OPT.q==='med'){tier=1;tierLocked=true;}else if(OPT.q==='low'){tier=2;tierLocked=true;}
+var proj=new Float32Array(16);
+function resize(force){
+  var cssW=Math.max(1,canvas.clientWidth||window.innerWidth),cssH=Math.max(1,canvas.clientHeight||window.innerHeight);
+  var base=Math.min(window.devicePixelRatio||1,1.5);                   // render scale 1.5x CSS px, never the native 3.5x
+  var cw=Math.max(2,Math.round(cssW*base)),ch=Math.max(2,Math.round(cssH*base));
+  var W=Math.max(2,Math.round(cw*TIERS[tier].s)),H=Math.max(2,Math.round(ch*TIERS[tier].s));
+  if(!force&&cw===S.cw&&ch===S.ch&&W===S.W&&H===S.H&&TA)return;
+  if(canvas.width!==cw||canvas.height!==ch){canvas.width=cw;canvas.height=ch;}
+  S.cw=cw;S.ch=ch;S.cssW=cssW;S.cssH=cssH;S.W=W;S.H=H;S.px=W/cssW;
+  var bound=Math.min(FIT*W,(FIT-CENTER_UP)*H);
+  S.f=bound*Math.sqrt(CAM_D*CAM_D-BOUND*BOUND)/BOUND;S.ppu=S.f/CAM_D;S.oy=2*CENTER_UP;
+  var n=CAM_D-2.2,f=CAM_D+2.2;
+  for(var i=0;i<16;i++)proj[i]=0;
+  proj[0]=2*S.f/W;proj[5]=2*S.f/H;proj[9]=-S.oy;proj[10]=(n+f)/(n-f);proj[11]=-1;proj[14]=2*n*f/(n-f);
+  freeTarget(TA);freeTarget(TB);freeTarget(Q0);freeTarget(Q1);freeTarget(Q2);if(depthRB)gl.deleteRenderbuffer(depthRB);
+  depthRB=gl.createRenderbuffer();gl.bindRenderbuffer(gl.RENDERBUFFER,depthRB);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,W,H);
+  TA=mkTarget(W,H,depthRB);TB=mkTarget(W,H,depthRB);
+  var qw=Math.max(2,Math.ceil(W/4)),qh=Math.max(2,Math.ceil(H/4));
+  Q0=mkTarget(qw,qh,null);Q1=mkTarget(qw,qh,null);Q2=mkTarget(qw,qh,null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+function setTier(n){tier=n;resize(true);}
+
+/* ------------------------------------------------------------------ draw */
+var bgc=[0,0,0],c1=[0,0,0],c2=[0,0,0],c3=[0,0,0],c4=[0,0,0];
+function bindFacet(p){
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboFacet);setAttr(p.n);var st=FSTR*4;
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,st,0);
+  for(var i=1;i<p.n;i++)gl.vertexAttribPointer(i,4,gl.FLOAT,false,st,12+(i-1)*16);
+}
+function facetUniforms(p,phase){
+  gl.uniformMatrix4fv(p.uProj,false,proj);gl.uniform1i(p.uPal,0);gl.uniform1i(p.uGrain,1);gl.uniform1i(p.uAux,2);
+  gl.uniform3f(p.uL,LX,LY,LZ);gl.uniform2f(p.uRes,S.W,S.H);
+  gl.uniform4f(p.uBeat,HB,HBR,HBA,0);gl.uniform2f(p.uCen,S.W*0.5,S.H*(0.5+S.oy*0.5));
+  gl.uniform3fv(p['uTouch[0]'],tUni);gl.uniform3fv(p['uWake[0]'],wkUni);gl.uniform4f(p.uTouchP,(nActiveT>0||nWake>0)?1:0,ripPh,S.ppu,OPT.shade);
+  var ca=20*W0*sceneT,cb=13*W0*sceneT;
+  gl.uniform4f(p.uCau,0.11*Math.cos(ca),0.11*Math.sin(ca),0.09*Math.cos(cb+1.3),0.09*Math.sin(cb+1.3));
+}
+function rodUniforms(p,phase){
+  gl.uniformMatrix4fv(p.uProj,false,proj);gl.uniform2f(p.uRes,S.W,S.H);
+  gl.uniform4f(p.uCam,S.f,CAM_D-0.95,DOF_GAIN*S.px,0.006);
+  gl.uniform3f(p.uL,LX,LY,LZ);gl.uniform1f(p.uBt,HB);gl.uniform1f(p.uTime,animT);
+  palAt(phase,0.96,c1);palAt(phase,0.42,c2);palAt(phase+0.06,1.0,c3);
+  gl.uniform3f(p.uCol,0.80*0.88+c1[0]*0.12,0.83*0.88+c1[1]*0.12,0.87*0.88+c1[2]*0.12);   // matte pale steel, faintly tinted by the body (no glow)
+  gl.uniform3f(p.uShade,0.44*0.70+c2[0]*0.30,0.47*0.70+c2[1]*0.30,0.53*0.70+c2[2]*0.30);
+  gl.uniform3f(p.uHot,c3[0],c3[1],c3[2]);
+}
+function drawRods(first,count){if(count>0)gl.drawElements(gl.TRIANGLES,count*6,gl.UNSIGNED_SHORT,first*12);}
+function useRods(phase){
+  gl.useProgram(P.rod.p);rodUniforms(P.rod,phase);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboRod);setAttr(4);var st=RSTR*4;
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,st,0);gl.vertexAttribPointer(1,3,gl.FLOAT,false,st,12);gl.vertexAttribPointer(2,4,gl.FLOAT,false,st,24);gl.vertexAttribPointer(3,4,gl.FLOAT,false,st,40);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,iboQuads);
+}
+function useJoints(phase){
+  gl.useProgram(P.joint.p);rodUniforms(P.joint,phase);
+  palAt(phase+0.04,0.78,c4);gl.uniform3f(P.joint.uSheen,c4[0],c4[1],c4[2]);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboJoint);setAttr(3);var st=JSTR*4;
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,st,0);gl.vertexAttribPointer(1,4,gl.FLOAT,false,st,12);gl.vertexAttribPointer(2,4,gl.FLOAT,false,st,28);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,iboQuads);
+}
+function drawLattice(phase){
+  useRods(phase);drawRods(0,draws.latRods);
+  useJoints(phase);drawRods(0,draws.latJoints);
+}
+function drawCage(phase){
+  if(!SHOW_CAGE)return;   // outer cage retired (Nick, 11-16): the lattice on the body is the frame now
+  var g=TIERS[tier].ghost,r0=NR,j0=NN;
+  useRods(phase);drawRods(r0+CR*(NGHOST-g),CR*g);
+  useJoints(phase);drawRods(j0+CN*(NGHOST-g),CN*g);
+  r0+=CR*NGHOST;j0+=CN*NGHOST;
+  useRods(phase);drawRods(r0,draws.cgRodFar);
+  useJoints(phase);drawRods(j0,draws.cgJFar);
+  useRods(phase);drawRods(r0+draws.cgRodFar,draws.cgRodNear);
+  useJoints(phase);drawRods(j0+draws.cgJFar,draws.cgJNear);
+}
+var sceneT=0,animT=0,HB=0,HBR=0,HBA=0;
+function colourPos(t){var p=5*t/LOOP;return p-Math.floor(p);}   // one full turn of the hue wheel every 120 s (k = 5)
+/* background extras: caustic drift (smooth + re-forming on each fold step), heartbeat glow, 8 drifting shards */
+var SHB=[[0.14,0.84,0.050,0.4],[0.84,0.80,0.070,2.1],[0.50,0.93,0.035,1.2],[0.10,0.22,0.065,3.0],[0.86,0.16,0.045,0.9],[0.32,0.08,0.040,2.6],[0.70,0.90,0.030,4.0],[0.60,0.12,0.055,5.1]];
+var shU=new Float32Array(32),shA=new Float32Array(32),_bc=[0,0,0];
+function bgExtras(phase){
+  var t=sceneT,ts=stepT(t,0.0),a=20*W0*t,b=13*W0*t;
+  gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,texAux);gl.uniform1i(P.bg.uAux,2);
+  gl.uniform4f(P.bg.uCauD,0.10*Math.cos(a)+0.021*ts,0.10*Math.sin(a)-0.013*ts,0.08*Math.cos(b+1.3)-0.017*ts,0.08*Math.sin(b+1.3)+0.019*ts);
+  palAt(phase,0.92,_bc);gl.uniform4f(P.bg.uBC,_bc[0],_bc[1],_bc[2],Math.min(HB,1.2));
+  // rings close inward (k=60: a new ring every 10 s), slow wobble turn; shimmer clock
+  gl.uniform4f(P.bg.uVx,0,7*W0*t,animT,60*W0*t);
+  // mineral grains pressed inward: drift toward the crystal on gently curving paths, shrink, get absorbed at the skin
+  for(var i=0;i<8;i++){
+    var kk=20+3*(i%3),pp=kk*t/LOOP+i/8;pp-=Math.floor(pp);
+    var rr2=3.5-2.25*Math.pow(pp,0.85),th=i*2.39996+0.9*pp+0.25*Math.sin(5*W0*t+i);
+    var dx=rr2*Math.cos(th),dy=rr2*Math.sin(th)*1.25;
+    shU[i*4]=0.5+dx*S.ppu/S.W;shU[i*4+1]=0.5+CENTER_UP+dy*S.ppu/S.H;
+    shU[i*4+2]=0.022+0.048*(1-pp);shU[i*4+3]=th*1.3+i+0.8*pp;
+    var fa=sstep(0.0,0.15,pp)*(1-sstep(0.72,0.95,pp));
+    shA[i*4]=(0.34+0.12*(i%3)/2)*fa;shA[i*4+1]=0.006+0.022*(1-pp);shA[i*4+2]=1.0;shA[i*4+3]=0;
+  }
+  gl.uniform1f(P.bg.uBGI,BGI);gl.uniform4fv(P.bg['uSh[0]'],shU);gl.uniform4fv(P.bg['uShA[0]'],shA);
+  palAt(phase+0.5,0.80,_bc);gl.uniform3f(P.bg.uShC,bgc[0]*0.6+_bc[0]*0.4+0.10,bgc[1]*0.6+_bc[1]*0.4+0.10,bgc[2]*0.6+_bc[2]*0.4+0.10);
+}
+function draw(){
+  var W=S.W,H=S.H,phase=colourPos(sceneT),bAge=beatAge(sceneT);
+  HB=Math.min(beat(sceneT)*(1+0.3*tMax),1.3);HBR=bAge*2.3;HBA=Math.exp(-bAge*4.2)*sstep(0,0.06,bAge);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboFacet);gl.bufferSubData(gl.ARRAY_BUFFER,0,facetData);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboRod);gl.bufferSubData(gl.ARRAY_BUFFER,0,rodData);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboJoint);gl.bufferSubData(gl.ARRAY_BUFFER,0,jointData);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,texPal);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,texGrain);
+  gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,texAux);
+  gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,null);
+  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,null);
+  // ================= pass A: everything that lies behind the front glass
+  gl.bindFramebuffer(gl.FRAMEBUFFER,TA.f);gl.viewport(0,0,W,H);
+  gl.disable(gl.BLEND);gl.depthMask(true);gl.clearColor(0,0,0,0);gl.clearDepth(1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  // depth of the nearest front hull face: splits lattice / cage pixels into "behind the glass" and "in front"
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LESS);gl.colorMask(false,false,false,false);
+  gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,2);
+  gl.useProgram(P.depth.p);gl.uniformMatrix4fv(P.depth.uProj,false,proj);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vboFacet);setAttr(1);gl.vertexAttribPointer(0,3,gl.FLOAT,false,FSTR*4,0);
+  gl.drawArrays(gl.TRIANGLES,draws.frontFirst,draws.frontCount);
+  gl.disable(gl.POLYGON_OFFSET_FILL);gl.colorMask(true,true,true,true);gl.depthMask(false);gl.disable(gl.DEPTH_TEST);
+  // background
+  bgAt(phase,bgc);
+  gl.useProgram(P.bg.p);gl.uniform3f(P.bg.uBg,bgc[0],bgc[1],bgc[2]);
+  gl.uniform4f(P.bg.uObj,0.5,0.5+CENTER_UP,S.ppu/H,1.58);gl.uniform1f(P.bg.uAsp,W/H);bgExtras(phase);drawQuad();
+  // far cage + far lattice (only where they are behind the front hull surface)
+  gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ZERO,gl.ONE);
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.GREATER);
+  drawCage(phase);drawLattice(phase);
+  gl.disable(gl.DEPTH_TEST);
+  // far hull faces (inside view), sorted far -> near; alpha channel accumulates body coverage
+  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(P.back.p);facetUniforms(P.back,phase);bindFacet(P.back);
+  gl.uniform4f(P.back.uPhase,phase,1.0,0.03,S.px);
+  gl.uniform4f(P.back.uK,0.88,0.20,0.22,0.34);
+  gl.drawArrays(gl.TRIANGLES,draws.backFirst,draws.backCount);
+  // soft internal glow
+  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE,gl.ZERO,gl.ONE);
+  palAt(phase,1.0,c1);
+  gl.useProgram(P.glow.p);gl.uniform4f(P.glow.uC,0,S.oy+2*S.ppu*0.12/H,2*S.ppu*(0.95+0.16*HB)/W,2*S.ppu*(0.95+0.16*HB)/H);gl.uniform4f(P.glow.uCol,c1[0],c1[1],c1[2],0.06+0.30*HB);drawQuad();
+  // core crystal
+  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(P.back.p);bindFacet(P.back);
+  gl.uniform4f(P.back.uPhase,phase+0.015,-0.3,0.02,S.px);
+  gl.uniform4f(P.back.uK,1.0,0.22,0.22,0.70);   // blocks: solid, dense
+  gl.drawArrays(gl.TRIANGLES,draws.coreFirst,draws.coreCount);
+  gl.disable(gl.BLEND);
+  // quarter-res blur of A: what frosted panes see
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Q1.f);gl.viewport(0,0,Q1.w,Q1.h);
+  gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,TA.t);
+  gl.useProgram(P.down.p);gl.uniform1i(P.down.uTex,3);gl.uniform2f(P.down.uTexel,1/W,1/H);gl.uniform3f(P.down.uThr,0,1,0);drawQuad();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Q0.f);gl.bindTexture(gl.TEXTURE_2D,Q1.t);
+  gl.useProgram(P.blur.p);gl.uniform1i(P.blur.uTex,3);gl.uniform2f(P.blur.uDir,1/Q1.w,0);drawQuad();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Q1.f);gl.bindTexture(gl.TEXTURE_2D,Q0.t);gl.uniform2f(P.blur.uDir,0,1/Q1.h);drawQuad();
+  // ================= pass B: copy A, then the front glass panes refract it, then the crisp near lattice + cage
+  gl.bindFramebuffer(gl.FRAMEBUFFER,TB.f);gl.viewport(0,0,W,H);
+  gl.bindTexture(gl.TEXTURE_2D,TA.t);
+  gl.useProgram(P.copy.p);gl.uniform1i(P.copy.uTex,3);drawQuad();
+  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,Q1.t);
+  gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE);
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
+  gl.useProgram(P.front.p);facetUniforms(P.front,phase);bindFacet(P.front);
+  gl.uniform1i(P.front.uBehind,3);gl.uniform1i(P.front.uBlur,4);
+  gl.uniform4f(P.front.uPhase,phase,0.0,0.03,S.px);
+  gl.uniform4f(P.front.uK,0.085*S.ppu,1.8,0.26,0.38);
+  gl.drawArrays(gl.TRIANGLES,draws.frontFirst,draws.frontCount);
+  drawLattice(phase);drawCage(phase);
+  gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+  // ================= bloom
+  var useBloom=TIERS[tier].bloom;
+  if(useBloom){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,Q0.f);gl.viewport(0,0,Q0.w,Q0.h);
+    gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,TB.t);
+    gl.useProgram(P.down.p);gl.uniform1i(P.down.uTex,3);gl.uniform2f(P.down.uTexel,1/W,1/H);gl.uniform3f(P.down.uThr,0.90,0.12,1);drawQuad();
+    gl.useProgram(P.blur.p);gl.uniform1i(P.blur.uTex,3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,Q2.f);gl.bindTexture(gl.TEXTURE_2D,Q0.t);gl.uniform2f(P.blur.uDir,1.3/Q0.w,0);drawQuad();
+    gl.bindFramebuffer(gl.FRAMEBUFFER,Q0.f);gl.bindTexture(gl.TEXTURE_2D,Q2.t);gl.uniform2f(P.blur.uDir,0,1.3/Q0.h);drawQuad();
+  }
+  // ================= final composite to the screen
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,S.cw,S.ch);
+  var src=TB.t,bl=Q0.t,amt=useBloom?0.55+0.22*HB:0;
+  if(OPT.view==='a'){src=TA.t;amt=0;}else if(OPT.view==='blur'){src=Q1.t;amt=0;}else if(OPT.view==='bloom'){src=Q0.t;amt=0;}else if(OPT.view==='grain'){src=texGrain;amt=0;}else if(OPT.view==='aux'){src=texAux;amt=0;}
+  gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,src);
+  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,bl);
+  gl.useProgram(P.fin.p);gl.uniform1i(P.fin.uScene,3);gl.uniform1i(P.fin.uBloom,4);
+  gl.uniform4f(P.fin.uFx,amt,OPT.view?0:0.12,OPT.view?0:1.6/255,S.cw/S.ch);drawQuad();
+}
+
+/* ------------------------------------------------------------------ touch: up to 5 gravity wells, 1-finger drag orbits */
+function findSlot(id){for(var i=0;i<TN;i++)if(tch[i].id===id)return tch[i];return null;}
+/* touch only counts when it lands on the geodesic object itself (circle through its outermost projected frame/cage points) */
+function onObject(cx,cy){
+  var k=S.cssW/S.W,ox=S.cssW*0.5,oy=S.cssH-S.H*(0.5+S.oy*0.5)*k,rmax=0,i,g,d;
+  function acc(x,y,z){var iz=S.f/(-z);d=Math.hypot((S.W*0.5+x*iz)*k-ox,(S.H-(S.H*(0.5+S.oy*0.5)+y*iz))*k-oy);if(d>rmax)rmax=d;}
+  for(i=0;i<HV;i++)acc(hv[i*3],hv[i*3+1],hv[i*3+2]);
+  for(i=0;i<NN;i++)acc(ln[i*3],ln[i*3+1],ln[i*3+2]);
+  for(i=0;i<CN;i++)acc(cg[0][i*3],cg[0][i*3+1],cg[0][i*3+2]);
+  return Math.hypot(cx-ox,cy-oy)<=rmax+8;
+}
+function onDown(e){
+  e.preventDefault();
+  if(!onObject(e.clientX,e.clientY))return;   // finger landed on empty background: ignore
+  var best=null;
+  for(var i=0;i<TN;i++){var t=tch[i];if(t.id===-1&&(!best||t.s<best.s))best=t;}
+  if(!best)return;
+  best.id=e.pointerId;best.on=true;best.x=e.clientX;best.y=e.clientY;
+  if(best.s<0.05){best.sx=best.x;best.sy=best.y;}
+  var n=0;for(i=0;i<TN;i++)if(tch[i].on)n++;
+  orb.drag=n===1?e.pointerId:-1;orb.dx=orb.dy=0;
+  best.lx=best.x;best.ly=best.y;best.lt=e.timeStamp||performance.now();
+  try{canvas.setPointerCapture(e.pointerId);}catch(err){}
+}
+function onMove(e){
+  var t=findSlot(e.pointerId);if(!t)return;e.preventDefault();
+  if(orb.drag===e.pointerId){orb.dx+=e.clientX-t.x;orb.dy+=e.clientY-t.y;}
+  t.x=e.clientX;t.y=e.clientY;
+  // drop a wake node every ~12 px of travel; strength from finger speed
+  var mx=t.x-t.lx,my=t.y-t.ly,md=Math.sqrt(mx*mx+my*my);
+  if(md>=12){var now=e.timeStamp||performance.now(),sp=md/Math.max(now-t.lt,4)*1000,st=sstep(40,520,sp);
+    if(st>0.03){var w=wkN[wkHead];wkHead=(wkHead+1)%WK;w.x=t.x;w.y=t.y;w.dx=mx/md;w.dy=my/md;w.s=st;w.born=animT;}
+    t.lx=t.x;t.ly=t.y;t.lt=now;}
+}
+function onUp(e){
+  var t=findSlot(e.pointerId);if(!t)return;
+  t.id=-1;t.on=false;if(orb.drag===e.pointerId)orb.drag=-1;
+}
+function updateTouch(dt){
+  var i,n=0;
+  for(i=0;i<TN;i++){
+    var t=tch[i],k=1-Math.exp(-dt/(t.on?0.16:0.85));
+    t.s+=((t.on?1:0)-t.s)*k;if(!t.on&&t.s<0.001)t.s=0;                // melt back, never snap
+    var kp=1-Math.exp(-dt/0.05);t.sx+=(t.x-t.sx)*kp;t.sy+=(t.y-t.sy)*kp;
+    var xd=t.sx*S.W/S.cssW,yd=(S.cssH-t.sy)*S.H/S.cssH;
+    tS[i]=t.s;tX[i]=(xd-S.W*0.5)/S.f;tY[i]=(yd-S.H*(0.5+S.oy*0.5))/S.f;
+    tUni[i*3]=xd;tUni[i*3+1]=yd;tUni[i*3+2]=t.s;if(t.s>0.002)n++;
+  }
+  nActiveT=n;tMax=0;for(i=0;i<TN;i++)if(tS[i]>tMax)tMax=tS[i];
+  n=0;
+  for(i=0;i<WK;i++){
+    var wn=wkN[i],age=animT-wn.born,ws=0;
+    if(age>=0&&age<WK_LIFE)ws=wn.s*sstep(0,0.10,age)*(1-sstep(0.2,1,age/WK_LIFE));     // quick rise, long smooth melt
+    var wxd=wn.x*S.W/S.cssW,wyd=(S.cssH-wn.y)*S.H/S.cssH;
+    wkS[i]=ws;wkAge[i]=age;wkX[i]=(wxd-S.W*0.5)/S.f;wkY[i]=(wyd-S.H*(0.5+S.oy*0.5))/S.f;wkDx[i]=wn.dx;wkDy[i]=-wn.dy;
+    wkUni[i*3]=wxd;wkUni[i*3+1]=wyd;wkUni[i*3+2]=ws;if(ws>0.003)n++;
+  }
+  nWake=n;
+  ripPh=animT*1.15;ripPh-=Math.floor(ripPh);
+  // orbit: drag adds yaw / pitch, release keeps inertia and eases back to the automatic rotation
+  if(orb.drag!==-1&&dt>0){
+    var ay=orb.dx*0.0085,ap=orb.dy*0.0060;orb.dx=orb.dy=0;
+    orb.yaw+=ay;orb.pitch=clamp(orb.pitch+ap,-0.85,0.85);
+    var kv2=1-Math.exp(-dt/0.08);orb.vy+=(ay/dt-orb.vy)*kv2;orb.vp+=(ap/dt-orb.vp)*kv2;
+  }else{
+    orb.yaw+=orb.vy*dt;orb.vy*=Math.exp(-dt/0.75);
+    var w=3.2;orb.vp+=(-w*w*orb.pitch-2*w*orb.vp)*dt;orb.pitch=clamp(orb.pitch+orb.vp*dt,-0.85,0.85);   // critically damped return of the tilt
+  }
+  if(orb.yaw>TAU*8||orb.yaw<-TAU*8)orb.yaw%=TAU;
+}
+
+/* ------------------------------------------------------------------ main loop: 60 fps cap, pause when hidden, adaptive quality */
+var raf=0,lastT=0,running=false,frames=0,perf={acc:0,n:0,slow:0,fast:0,backoff:8,warm:2.0},dbgAcc=0,dbgN=0,dbgLast=0;
+function adapt(ms){
+  if(tierLocked)return;
+  if(perf.warm>0){perf.warm-=ms/1000;return;}
+  perf.acc+=ms;perf.n++;
+  if(perf.acc<500)return;
+  var avg=perf.acc/perf.n,budget=1000/OPT.fps;perf.acc=0;perf.n=0;
+  if(avg>Math.max(18,budget*1.08)){perf.slow+=0.5;perf.fast=0;}else if(avg<budget*1.05){perf.fast+=0.5;perf.slow=Math.max(0,perf.slow-0.25);}else perf.fast=0;
+  if(perf.slow>=2&&tier<TIERS.length-1){setTier(tier+1);perf.slow=0;perf.fast=0;perf.backoff=Math.min(perf.backoff*2,120);perf.warm=1;}
+  else if(perf.fast>=perf.backoff&&tier>0){setTier(tier-1);perf.slow=0;perf.fast=0;perf.warm=1;}
+}
+function renderNow(dt){
+  resize(false);
+  if(!OPT.pause)sceneT+=dt;
+  if(!OPT.nowrap){sceneT%=LOOP;if(sceneT<0)sceneT+=LOOP;}
+  animT+=dt;
+  updateTouch(dt);
+  computeFrame(sceneT);
+  draw();
+  frames++;
+}
+function tick(now){
+  raf=requestAnimationFrame(tick);
+  var el=now-lastT;
+  if(el<1000/OPT.fps-1.5)return;                            // 60 (or 30) fps cap, also on 90 / 120 Hz panels
+  lastT=now;
+  renderNow(Math.min(el/1000,0.1));
+  adapt(el);
+  if(OPT.debug){dbgAcc+=el;dbgN++;if(now-dbgLast>500){dbgEl.textContent=(1000/(dbgAcc/dbgN)).toFixed(1)+' fps  '+(dbgAcc/dbgN).toFixed(1)+' ms\n'+TIERS[tier].name+(tierLocked?' (locked)':' (auto)')+'  '+S.W+'x'+S.H+'\nt='+sceneT.toFixed(2)+' s';dbgAcc=0;dbgN=0;dbgLast=now;}}
+}
+function start(){if(running||!gl)return;running=true;lastT=performance.now()-1000/OPT.fps;raf=requestAnimationFrame(tick);}
+function stop(){running=false;cancelAnimationFrame(raf);}
+
+function boot(){
+  buildScene();allocDynamic();
+  sceneT=OPT.nowrap?OPT.t:((OPT.t%LOOP)+LOOP)%LOOP;
+  if(!initGL()){document.body.style.background='#9fb1a4';return;}
+  resize(true);
+  if(OPT.debug)dbgEl.style.display='block';
+  var np={passive:false};
+  canvas.addEventListener('pointerdown',onDown,np);canvas.addEventListener('pointermove',onMove,np);
+  canvas.addEventListener('pointerup',onUp,np);canvas.addEventListener('pointercancel',onUp,np);
+  ['touchstart','touchmove','touchend','touchcancel','gesturestart','gesturechange','gestureend','contextmenu','selectstart','dragstart','dblclick'].forEach(function(n){
+    document.addEventListener(n,function(e){e.preventDefault();},np);});
+  document.addEventListener('wheel',function(e){if(e.ctrlKey)e.preventDefault();},np);
+  window.addEventListener('resize',function(){resize(false);});
+  document.addEventListener('visibilitychange',function(){if(document.hidden)stop();else start();});
+  canvas.addEventListener('webglcontextlost',function(e){e.preventDefault();stop();},false);
+  canvas.addEventListener('webglcontextrestored',function(){if(initGL()){resize(true);start();}},false);
+  if(!document.hidden)start();
+}
+/* test hooks (used by the headless verification, harmless otherwise) */
+window.__gm={
+  get frames(){return frames;},get time(){return sceneT;},get tier(){return TIERS[tier].name;},
+  size:function(){return {W:S.W,H:S.H,cw:S.cw,ch:S.ch,cssW:S.cssW,cssH:S.cssH,f:S.f,ppu:S.ppu,px:S.px};},
+  wakeStroke:function(x0,y0,x1,y1,st){var n=8,dx=x1-x0,dy=y1-y0,l=Math.sqrt(dx*dx+dy*dy)||1;for(var i=0;i<n;i++){var w=wkN[wkHead];wkHead=(wkHead+1)%WK;w.x=x0+dx*i/(n-1);w.y=y0+dy*i/(n-1);w.dx=dx/l;w.dy=dy/l;w.s=st;w.born=animT-0.25;}},
+  beat:function(t){return beat(t);},
+  halt:function(){stop();},
+  coverage:function(t){computeFrame(t);return {cov:lastCov,shift:thrShift,after:(function(){var cs=0,n=0;for(var i=0;i<HF;i++)if(covW[i]>0){cs+=covW[i]*mCov(thrA[i]-thrShift);n+=covW[i];}return cs/n;})()};},step:function(dt){renderNow(dt);return frames;},
+  clear:function(t){computeFrame(t);var G=cg[0],mn=9,i,k;
+    for(i=0;i<30;i++){var a=cgA[i]*3,b=cgB[i]*3;for(k=1;k<10;k++){var u=k/10,x=G[a]+(G[b]-G[a])*u-CX,y=G[a+1]+(G[b+1]-G[a+1])*u-CY,z=G[a+2]+(G[b+2]-G[a+2])*u-CZ,l=Math.sqrt(x*x+y*y+z*z),d=l-hullDist(x/l,y/l,z/l);if(d<mn)mn=d;}}
+    var ml=9;for(i=0;i<HV;i++){var x=ln[i*3]-CX,y=ln[i*3+1]-CY,z=ln[i*3+2]-CZ,l=Math.sqrt(x*x+y*y+z*z),d=l-hullDist(x/l,y/l,z/l);if(d<ml)ml=d;}
+    return [mn,ml];},
+
+  radii:function(t){computeFrame(t);function st(A,n){var lo=9,hi=0,i,r;for(i=0;i<n;i++){r=Math.hypot(A[i*3]-CX,A[i*3+1]-CY,A[i*3+2]-CZ);if(r<lo)lo=r;if(r>hi)hi=r;}return [lo,hi];}
+    var o=[],i;for(i=0;i<12;i++)o.push(Math.hypot(hv[i*3]-CX,hv[i*3+1]-CY,hv[i*3+2]-CZ),Math.hypot(ln[i*3]-CX,ln[i*3+1]-CY,ln[i*3+2]-CZ),Math.hypot(cg[0][i*3]-CX,cg[0][i*3+1]-CY,cg[0][i*3+2]-CZ));return o;},
+  wake:function(){return {n:nWake,s:Array.prototype.slice.call(wkS)};},
+  touches:function(){return tch.map(function(t){return {on:t.on,s:t.s};});},
+  orbit:function(){return {yaw:orb.yaw,pitch:orb.pitch,vy:orb.vy};},
+  renderAt:function(t){sceneT=t;var p=OPT.pause;OPT.pause=true;renderNow(0);OPT.pause=p;return frames;},
+  /* projected bounding box (CSS px) of all geometry incl. pearl radii at scene time t */
+  bbox:function(t){
+    computeFrame(t);
+    var x0=1e9,x1=-1e9,y0=1e9,y1=-1e9,bx0=1e9,bx1=-1e9,by0=1e9,by1=-1e9,k=S.cssW/S.W,i;
+    function acc(x,y,z,r,body){var iz=S.f/(-z),sx=(S.W*0.5+x*iz)*k,sy=(S.H-(S.H*(0.5+S.oy*0.5)+y*iz))*k,rr2=r*iz*k;
+      if(body){if(sx<bx0)bx0=sx;if(sx>bx1)bx1=sx;if(sy<by0)by0=sy;if(sy>by1)by1=sy;}
+      if(sx-rr2<x0)x0=sx-rr2;if(sx+rr2>x1)x1=sx+rr2;if(sy-rr2<y0)y0=sy-rr2;if(sy+rr2>y1)y1=sy+rr2;}
+    for(i=0;i<HV;i++)acc(hv[i*3],hv[i*3+1],hv[i*3+2],0,true);
+    for(i=0;i<KV;i++)acc(kv[i*3],kv[i*3+1],kv[i*3+2],0,false);
+    for(i=0;i<NN;i++)acc(ln[i*3],ln[i*3+1],ln[i*3+2],nodeRad[i],false);
+    for(var g=0;g<=NGHOST;g++)for(i=0;i<CN;i++)acc(cg[g][i*3],cg[g][i*3+1],cg[g][i*3+2],CG_PEARL,false);
+    return {x0:x0,x1:x1,y0:y0,y1:y1,bx0:bx0,bx1:bx1,by0:by0,by1:by1,w:S.cssW,h:S.cssH};
+  }
+};
+boot();
+})();
+</script>
+</body>
+</html>
